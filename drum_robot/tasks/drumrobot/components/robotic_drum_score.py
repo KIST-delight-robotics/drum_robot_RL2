@@ -51,6 +51,9 @@ class RDSCfg:
     slow_factor: float = 1.5        # slow_factor=2 -> 0.5배속 / slow_factor=0.5 -> 2배속
     start_offset_steps: int = 20
 
+    # 랜덤 생성 시 동시 타격(좌우 쌍) 비율. 0.0=단일만(1단계), 0.2~=2단계
+    double_hit_ratio: float = 0.1
+
     note_to_drum_idx: dict = field(default_factory=lambda: {
         "Acoustic Snare": 0,
         "Electric Snare": 0,
@@ -109,6 +112,13 @@ class RDS:
         instruments = Instruments()
         self.num_drums = len(instruments.all)
 
+        # 동시 타격용 좌우 드럼 쌍 (왼쪽 x<0 × 오른쪽 x>=0, 교차 불필요)
+        xs = [inst.position[0] for inst in instruments.all.values()]
+        left_drums = [i for i, x in enumerate(xs) if x < 0.0]
+        right_drums = [i for i, x in enumerate(xs) if x >= 0.0]
+        pairs = [(l, r) for l in left_drums for r in right_drums]
+        self.double_pairs = torch.tensor(pairs, device=self.device, dtype=torch.long)  # (P, 2)
+
         # midi
         random.seed(time.time_ns())
         self.rng = random.Random()
@@ -124,6 +134,7 @@ class RDS:
 
         self.rds = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
         self.rds_visit = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)
+        self.rds_visit_vel = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)  # 타격 순간 하강 속도 기록
 
         # util
         self.env_arange = torch.arange(self.env.num_envs, device=self.device)
@@ -199,14 +210,18 @@ class RDS:
 
         return next_hits
     
-    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor):
-        self.rds_visit[self.env_arange, steps, :] = hit_mask    # 타격한 시간에 방문 처리
+    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor):
+        self.rds_visit[self.env_arange, steps, :] = hit_mask        # 타격한 시간에 방문 처리
+        self.rds_visit_vel[self.env_arange, steps, :] = hit_vel     # 그 시간의 타격 속도 기록
 
     def get_rds(self) -> torch.Tensor:
         return self.rds
-    
+
     def get_rds_visit(self) -> torch.Tensor:
         return self.rds_visit
+
+    def get_rds_visit_vel(self) -> torch.Tensor:
+        return self.rds_visit_vel
 
     def reset(self, env_ids: torch.Tensor, score_ratio: float=0.5, selection_strength: float=0.5):
         N = len(env_ids)
@@ -236,6 +251,7 @@ class RDS:
         robotic_drum_score = torch.cat(outputs, dim=0)
         self.rds[env_ids] = robotic_drum_score
         self.rds_visit[env_ids] = False
+        self.rds_visit_vel[env_ids] = 0.0
 
     # ===== INIT =====
     def _glob_midi_files(self) -> list:
@@ -449,8 +465,22 @@ class RDS:
             time_rand = torch.randint(si, max(si + 1, ei), (N,), device=self.device)
             ########################################################################
 
-            drum_rand = torch.randint(0, M, (N,), device=self.device)
+            env = torch.arange(N, device=self.device)
 
-            rds_rand[torch.arange(N), time_rand, drum_rand] = 1
+            # env별 단일/동시 결정
+            is_double = torch.rand(N, device=self.device) < self.cfg.double_hit_ratio
+
+            # 단일 타격: 아무 드럼 하나
+            drum_single = torch.randint(0, M, (N,), device=self.device)
+            single_mask = ~is_double
+            rds_rand[env[single_mask], time_rand[single_mask], drum_single[single_mask]] = 1
+
+            # 동시 타격: 좌우 쌍에서 하나 뽑아 두 드럼
+            P = self.double_pairs.shape[0]
+            if P > 0:
+                pair_idx = torch.randint(0, P, (N,), device=self.device)
+                pair = self.double_pairs[pair_idx]   # (N, 2)
+                rds_rand[env[is_double], time_rand[is_double], pair[is_double, 0]] = 1
+                rds_rand[env[is_double], time_rand[is_double], pair[is_double, 1]] = 1
 
         return rds_rand

@@ -82,7 +82,17 @@ class DrumRobotEnv(DirectRLEnv):
             robot=self.robot,
             env_origins=self.scene.env_origins,
         )
-        
+
+        # 관절별 action_scale (손목만 상한 크게 → 손목 스냅 가능). ctrl_joint_names는 resolve된 순서
+        ctrl_joint_names = self.robot_interface.get_ctrl_joint_name()
+        scale_list = [
+            self.cfg.wrist_action_scale if "wrist" in name else self.cfg.action_scale
+            for name in ctrl_joint_names
+        ]
+        self.action_scale_vec = torch.tensor(
+            scale_list, device=self.device, dtype=torch.float32
+        ).unsqueeze(0)  # (1, 9)
+
         # RDS
         self.rds = RDS(
             device=self.device,
@@ -102,6 +112,7 @@ class DrumRobotEnv(DirectRLEnv):
             device=self.device,
             cfg=RewardComputerCfg(),
             env=env_specs,
+            ctrl_joint_names=self.robot_interface.get_ctrl_joint_name(),
         )
 
         # 로봇 초기 위치 initializer
@@ -179,8 +190,8 @@ class DrumRobotEnv(DirectRLEnv):
         # 로봇 위치 가져오기
         robot_q = self.robot_interface.get_joint_pos(self.robot)
 
-        # 목표 위치 = 현재 위치 + actions
-        target_q_d = actions * self.cfg.action_scale
+        # 목표 위치 = 현재 위치 + actions (관절별 상한: 손목만 큼)
+        target_q_d = actions * self.action_scale_vec
         robot_q_next = robot_q + target_q_d * self.step_dt
         usd_q_next = self.robot_interface.clip_and_convert(robot_q_next)
 
@@ -211,17 +222,23 @@ class DrumRobotEnv(DirectRLEnv):
             prev_hit_armed, hit_per_arm,
         ) = self.hit_detector.detect_hit(tip_pos=tip_pos, drum_pos=self.drum_pos)
 
-        # 타격 시간 기록
-        self.rds.set_rds_visit(steps=self.steps, hit_mask=hit_mask)
+        # 타격 순간 드럼별 하강 속도 (양팔 중 max)
+        down_vel = torch.clamp(-tip_vel[:, :, 2], 0.0)                         # (N, 2)
+        hit_vel_per_drum = (hit_per_arm.float() * down_vel[:, :, None]).max(dim=1).values  # (N, M)
+
+        # 타격 시간/속도 기록
+        self.rds.set_rds_visit(steps=self.steps, hit_mask=hit_mask, hit_vel=hit_vel_per_drum)
 
         # 결과
         rds = self.rds.get_rds()
         rds_visit = self.rds.get_rds_visit()
-        success, wrong_hit, missed_target, time_error = self.hit_detector.get_result(
+        rds_visit_vel = self.rds.get_rds_visit_vel()
+        success, wrong_hit, missed_target, time_error, success_impact_vel, target_done = self.hit_detector.get_result(
             hit_mask=hit_mask,
             steps=self.steps,
             rds=rds,
             rds_visit=rds_visit,
+            rds_visit_vel=rds_visit_vel,
         )
 
         # 관절각, 관절 속도
@@ -252,6 +269,8 @@ class DrumRobotEnv(DirectRLEnv):
             wrist_pos=wrist_pos,
             elbow_pos=elbow_pos,
             hit_per_arm=hit_per_arm,
+            success_impact_vel=success_impact_vel,
+            target_done=target_done,
         )
 
         # 가중치 업데이트

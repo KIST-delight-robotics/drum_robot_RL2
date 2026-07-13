@@ -134,7 +134,8 @@ class RDS:
 
         self.rds = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
         self.rds_visit = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)
-        self.rds_visit_vel = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)  # 타격 순간 하강 속도 기록
+        self.rds_visit_vel = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)   # 타격 순간 하강 속도 기록
+        self.rds_visit_wrist = torch.zeros((N, T, M), device=self.device, dtype=torch.float32) # 타격 순간 손목 각속도 기록
 
         # util
         self.env_arange = torch.arange(self.env.num_envs, device=self.device)
@@ -210,9 +211,10 @@ class RDS:
 
         return next_hits
     
-    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor):
-        self.rds_visit[self.env_arange, steps, :] = hit_mask        # 타격한 시간에 방문 처리
-        self.rds_visit_vel[self.env_arange, steps, :] = hit_vel     # 그 시간의 타격 속도 기록
+    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor, hit_wrist: torch.Tensor):
+        self.rds_visit[self.env_arange, steps, :] = hit_mask         # 타격한 시간에 방문 처리
+        self.rds_visit_vel[self.env_arange, steps, :] = hit_vel      # 그 시간의 타격 속도 기록
+        self.rds_visit_wrist[self.env_arange, steps, :] = hit_wrist  # 그 시간의 손목 각속도 기록
 
     def get_rds(self) -> torch.Tensor:
         return self.rds
@@ -222,6 +224,9 @@ class RDS:
 
     def get_rds_visit_vel(self) -> torch.Tensor:
         return self.rds_visit_vel
+
+    def get_rds_visit_wrist(self) -> torch.Tensor:
+        return self.rds_visit_wrist
 
     def reset(self, env_ids: torch.Tensor, score_ratio: float=0.5, selection_strength: float=0.5):
         N = len(env_ids)
@@ -252,6 +257,7 @@ class RDS:
         self.rds[env_ids] = robotic_drum_score
         self.rds_visit[env_ids] = False
         self.rds_visit_vel[env_ids] = 0.0
+        self.rds_visit_wrist[env_ids] = 0.0
 
     # ===== INIT =====
     def _glob_midi_files(self) -> list:

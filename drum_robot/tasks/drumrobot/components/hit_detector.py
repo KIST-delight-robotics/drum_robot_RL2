@@ -87,7 +87,8 @@ class HitDetector:
             rds: torch.Tensor,
             rds_visit: torch.Tensor,
             rds_visit_vel: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            rds_visit_wrist: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 현재 ±W 윈도우 타겟
         window_target_union = self._window_target_union(rds, steps)  # (N, M)
 
@@ -99,15 +100,16 @@ class HitDetector:
         valid_hit = hit_mask & window_target_union
         self.target_done = self.target_done | valid_hit
 
-        # 윈도우 끝났을 때 타격 성공 확인 (+ 성공한 타격의 속도). 끝난 타겟은 done 해제
-        success, missed_target, time_error, success_impact_vel = self._finalize_target_outcomes(
+        # 윈도우 끝났을 때 타격 성공 확인 (+ 성공 타격의 속도/손목각속도). 끝난 타겟은 done 해제
+        success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel = self._finalize_target_outcomes(
             rds=rds,
             rds_visit=rds_visit,
             rds_visit_vel=rds_visit_vel,
+            rds_visit_wrist=rds_visit_wrist,
             steps=steps,
         )
 
-        return success, wrong_hit, missed_target, time_error, success_impact_vel, self.target_done
+        return success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, self.target_done
     
     def reset(self, env_ids: torch.Tensor, tip_pos: torch.Tensor):
         # 팁 위치/속도 리셋
@@ -207,8 +209,8 @@ class HitDetector:
 
         return window_target_union
 
-    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # rds, rds_visit, rds_visit_vel: (N, T, M)
+    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, rds_visit_wrist: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # rds, rds_visit, rds_visit_vel, rds_visit_wrist: (N, T, M)
         # steps: (N,)
 
         N = self.env.num_envs
@@ -219,6 +221,7 @@ class HitDetector:
         success = torch.zeros((N, M), device=self.device, dtype=torch.bool)
         time_error = torch.full((N, M), -1, device=self.device, dtype=torch.int64)
         success_impact_vel = torch.zeros((N, M), device=self.device, dtype=torch.float32)
+        success_wrist_ang_vel = torch.zeros((N, M), device=self.device, dtype=torch.float32)
 
         # 윈도우 왼쪽 끝 스텝
         window_end_step = steps - W
@@ -241,9 +244,11 @@ class HitDetector:
 
             match_mask = hit_mask & cand_valid.unsqueeze(-1) & target_mask & (~success)
 
-            # 성공으로 매칭된 시간의 타격 속도를 기록 (타겟당 첫 매칭 1회)
-            vel_at_cand = rds_visit_vel[self.env_arange, cand_steps_clamped, :]  # (N, M)
+            # 성공으로 매칭된 시간의 타격 속도/손목각속도 기록 (타겟당 첫 매칭 1회)
+            vel_at_cand = rds_visit_vel[self.env_arange, cand_steps_clamped, :]     # (N, M)
+            wrist_at_cand = rds_visit_wrist[self.env_arange, cand_steps_clamped, :] # (N, M)
             success_impact_vel = torch.where(match_mask, vel_at_cand, success_impact_vel)
+            success_wrist_ang_vel = torch.where(match_mask, wrist_at_cand, success_wrist_ang_vel)
 
             success |= match_mask
 
@@ -251,7 +256,7 @@ class HitDetector:
 
         missed_target = target_mask & (~success)
 
-        return success, missed_target, time_error, success_impact_vel
+        return success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel
 
     def _get_hit_window_offsets(self, W: int) -> list:
         # offset 순서: [0, -1, +1, -2, +2, ...] 마스크가 "가장 작은 |offset|부터 매칭"되도록

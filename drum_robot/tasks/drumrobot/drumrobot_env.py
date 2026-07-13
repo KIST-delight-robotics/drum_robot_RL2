@@ -93,6 +93,13 @@ class DrumRobotEnv(DirectRLEnv):
             scale_list, device=self.device, dtype=torch.float32
         ).unsqueeze(0)  # (1, 9)
 
+        # 손목 관절 인덱스 [왼, 오] (손목 각속도 계산용). hit_per_arm 팔 축(0=왼,1=오)과 맞춤
+        name_to_idx = {name: i for i, name in enumerate(ctrl_joint_names)}
+        self.wrist_joint_ids = torch.tensor(
+            [name_to_idx["left_wrist"], name_to_idx["right_wrist"]],
+            device=self.device, dtype=torch.long,
+        )
+
         # RDS
         self.rds = RDS(
             device=self.device,
@@ -222,28 +229,35 @@ class DrumRobotEnv(DirectRLEnv):
             prev_hit_armed, hit_per_arm,
         ) = self.hit_detector.detect_hit(tip_pos=tip_pos, drum_pos=self.drum_pos)
 
+        # 관절각, 관절 속도 (손목 각속도 계산 위해 먼저 가져옴)
+        robot_pos = self.robot_interface.get_joint_pos(self.robot)
+        robot_vel = self.robot_interface.get_joint_vel(self.robot)
+        robot_torque = self.robot_interface.get_joint_torque(self.robot)
+
         # 타격 순간 드럼별 하강 속도 (양팔 중 max)
         down_vel = torch.clamp(-tip_vel[:, :, 2], 0.0)                         # (N, 2)
         hit_vel_per_drum = (hit_per_arm.float() * down_vel[:, :, None]).max(dim=1).values  # (N, M)
 
-        # 타격 시간/속도 기록
-        self.rds.set_rds_visit(steps=self.steps, hit_mask=hit_mask, hit_vel=hit_vel_per_drum)
+        # 타격 순간 드럼별 손목 각속도 (양팔 중, 그 드럼 친 팔의 손목)
+        wrist_vel_abs = robot_vel[:, self.wrist_joint_ids].abs()                # (N, 2)
+        hit_wrist_per_drum = (hit_per_arm.float() * wrist_vel_abs[:, :, None]).max(dim=1).values  # (N, M)
+
+        # 타격 시간/속도/손목각속도 기록
+        self.rds.set_rds_visit(steps=self.steps, hit_mask=hit_mask, hit_vel=hit_vel_per_drum, hit_wrist=hit_wrist_per_drum)
 
         # 결과
         rds = self.rds.get_rds()
         rds_visit = self.rds.get_rds_visit()
         rds_visit_vel = self.rds.get_rds_visit_vel()
-        success, wrong_hit, missed_target, time_error, success_impact_vel, target_done = self.hit_detector.get_result(
+        rds_visit_wrist = self.rds.get_rds_visit_wrist()
+        success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_done = self.hit_detector.get_result(
             hit_mask=hit_mask,
             steps=self.steps,
             rds=rds,
             rds_visit=rds_visit,
             rds_visit_vel=rds_visit_vel,
+            rds_visit_wrist=rds_visit_wrist,
         )
-
-        # 관절각, 관절 속도
-        robot_pos = self.robot_interface.get_joint_pos(self.robot)
-        robot_vel = self.robot_interface.get_joint_vel(self.robot)
 
         joint_low, joint_high = self.robot_interface.get_limit()
 
@@ -262,6 +276,7 @@ class DrumRobotEnv(DirectRLEnv):
             tip_vel=tip_vel,
             prev_hit_armed=prev_hit_armed,
             robot_vel=robot_vel,
+            robot_torque=robot_torque,
             actions=self.actions,
             robot_pos=robot_pos,
             joint_low=joint_low,
@@ -270,11 +285,19 @@ class DrumRobotEnv(DirectRLEnv):
             elbow_pos=elbow_pos,
             hit_per_arm=hit_per_arm,
             success_impact_vel=success_impact_vel,
+            success_wrist_ang_vel=success_wrist_ang_vel,
             target_done=target_done,
         )
 
         # 가중치 업데이트
         self.reward_computer.update_difficulty_weights(success=success, missed_target=missed_target)
+
+        # 추종오차 진단 (|목표 − 현재|, rad). 운동학 가정 검증용. USD 프레임 = 부호뒤집기라 |오차| 프레임 무관
+        ctrl_ids = self.robot_interface.get_ctrl_joint_ids()
+        current_usd = self.robot.data.joint_pos[:, ctrl_ids]                 # (N, 9)
+        track_err = (self.target_joint_pos - current_usd).abs()             # (N, 9)
+        log_terms["track_err_rad"] = track_err.mean(dim=-1)                 # 전 관절 평균
+        log_terms["track_err_wrist_rad"] = track_err[:, self.wrist_joint_ids].mean(dim=-1)  # 손목만
 
         # 로그 출력
         self.logger.add(log_terms)

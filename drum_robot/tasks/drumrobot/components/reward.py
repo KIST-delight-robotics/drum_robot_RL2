@@ -390,6 +390,7 @@ def _tip_position_penalties(
 @torch.jit.script
 def _global_penalties(
         joint_vel: torch.Tensor,
+        joint_torque: torch.Tensor,
         action: torch.Tensor,
         robot_pos: torch.Tensor,
         joint_low: torch.Tensor,
@@ -397,15 +398,19 @@ def _global_penalties(
         limit_margin: float,
         joint_vel_weight: torch.Tensor,
         action_weight: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     action_l2 = torch.sum(action_weight * action * action, dim=-1)
     joint_vel_l2 = torch.sum(joint_vel_weight * joint_vel * joint_vel, dim=-1)
+
+    # 기계적 일률 |τ·q̇| (W). 무게 인지적(무거운 팔 가속=고일률) + 유지 자세는 공짜(q̇≈0).
+    # 손목은 가벼워 물리적으로 저렴하므로 별도 배율 없이 균일 합산
+    power_l1 = torch.sum(torch.abs(joint_torque * joint_vel), dim=-1)
 
     low_v = torch.clamp((joint_low + limit_margin) - robot_pos, min=0.0)
     high_v = torch.clamp(robot_pos - (joint_high - limit_margin), min=0.0)
     limit_pen = torch.sum(low_v * low_v + high_v * high_v, dim=-1)
 
-    return action_l2, joint_vel_l2, limit_pen
+    return action_l2, joint_vel_l2, limit_pen, power_l1
 
 @torch.jit.script
 def compute_rewards(
@@ -422,6 +427,7 @@ def compute_rewards(
 
         action_l2: torch.Tensor,
         joint_vel_l2: torch.Tensor,
+        power_l1: torch.Tensor,
         limit_pen: torch.Tensor,
         tip_limit_pen: torch.Tensor,
         under_drum_pen: torch.Tensor,
@@ -439,6 +445,7 @@ def compute_rewards(
 
         w_action: float,
         w_joint_vel: float,
+        w_power: float,
         w_limit: float,
         w_tip_limit: float,
         w_under_drum: float,
@@ -446,6 +453,8 @@ def compute_rewards(
         self_col_pen: torch.Tensor,
         impact_vel_reward: torch.Tensor,
         w_impact_vel: float,
+        wrist_snap_reward: torch.Tensor,
+        w_wrist_snap: float,
         off_target_pen: torch.Tensor,
         w_off_target: float,
         crowd_pen: torch.Tensor,
@@ -464,9 +473,11 @@ def compute_rewards(
         + w_downward * downward_reward
 
         + w_impact_vel * impact_vel_reward
+        + w_wrist_snap * wrist_snap_reward
 
         - w_action * action_l2
         - w_joint_vel * joint_vel_l2
+        - w_power * power_l1
         - w_limit * limit_pen
         - w_tip_limit * tip_limit_pen
         - w_under_drum * under_drum_pen
@@ -513,19 +524,28 @@ class RewardComputerCfg:
     w_progress: float = 4.0
     w_proximity: float = 1.5
 
-    w_upward: float = 0.4
-    w_downward: float = 0.5
+    w_upward: float = 0 #0.4
+    w_downward: float = 0 #0.5
 
     w_impact_vel: float = 3.0
     impact_vel_max: float = 1.0
 
+    # 손목 스냅 보상 (성공 타격 시 손목 각속도 rad/s에 비례). 팔 대신 손목 사용 유도
+    w_wrist_snap: float = 3.0
+    wrist_snap_max: float = 12.0   # 정규화 기준 (실측 느긋 7~13 rad/s의 중간)
+
     w_action: float = 0.0003
-    w_wrist_action_scale: float = 0.01  # 손목 action 페널티 배율 (손목 스냅 위해 완화)
+    w_wrist_action_scale: float = 0.001  # 손목 action 페널티 배율 (손목 스냅 위해 완화)
     w_joint_vel: float = 0.0001
-    w_wrist_vel_scale: float = 0.01  # 손목 관절 속도 페널티 배율 (스윙 위해 완화)
+    w_wrist_vel_scale: float = 0.001  # 손목 관절 속도 페널티 배율 (스윙 위해 완화)
+    # 기계적 일률 |τ·q̇| 페널티. 헛스윙은 후반 현상이므로 성공률 게이팅으로 나중에 켬 (초기 탐색 방해 방지)
+    w_power_max: float = 0.005          # 램프 최대치 (성공률 full 이상에서 도달)
+    w_power_success_start: float = 0.6  # 이 성공률(EMA)부터 페널티 켜기 시작
+    w_power_success_full: float = 0.85  # 이 성공률(EMA)에서 최대치 도달
+    w_power_ema_beta: float = 0.9       # 성공률 EMA 평활 계수
     w_limit: float = 0.5
     w_tip_limit: float = 0.15
-    w_under_drum: float = 0.08
+    w_under_drum: float = 0.1 #0.08
     w_self_collision: float = 0.5
     self_collision_threshold: float = 0.10  # 스틱 간 거리 임계값 [m]
 
@@ -566,6 +586,10 @@ class RewardComputer:
             device=self.device, dtype=torch.long,
         )
 
+        # 일률 페널티 성공률 게이팅 상태 (초기엔 꺼짐 → 성공률 오르면 램프인)
+        self.w_power_eff = 0.0
+        self.success_ema = 0.0
+
         # 악기별 보상 가중치
         self.update_counter = 0
 
@@ -587,6 +611,7 @@ class RewardComputer:
             tip_vel: torch.Tensor,
             prev_hit_armed: torch.Tensor,
             robot_vel: torch.Tensor,
+            robot_torque: torch.Tensor,
             actions: torch.Tensor,
             robot_pos: torch.Tensor,
             joint_low: torch.Tensor,
@@ -595,6 +620,7 @@ class RewardComputer:
             elbow_pos: torch.Tensor,    # (N, 2, 3)
             hit_per_arm: torch.Tensor,  # (N, 2, M)
             success_impact_vel: torch.Tensor,  # (N, M) 성공한 타격의 하강 속도
+            success_wrist_ang_vel: torch.Tensor,  # (N, M) 성공한 타격의 손목 각속도
             target_done: torch.Tensor,  # (N, M) 유효 타격 완료된 타겟 (재타 downward 억제)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # goal
@@ -646,8 +672,9 @@ class RewardComputer:
         )
 
         # global penalties
-        action_l2, joint_vel_l2, limit_pen = _global_penalties(
+        action_l2, joint_vel_l2, limit_pen, power_l1 = _global_penalties(
             joint_vel=robot_vel,
+            joint_torque=robot_torque,
             action=actions,
             robot_pos=robot_pos,
             joint_low=joint_low,
@@ -669,6 +696,9 @@ class RewardComputer:
         # impact velocity: 성공한 타격의 속도에만 보상 (타겟당 1회). 연타 유인 제거
         impact_vel_reward = (success_impact_vel / (self.cfg.impact_vel_max + 1e-8)).sum(dim=1)  # (N,)
 
+        # wrist snap: 성공한 타격의 손목 각속도에 보상 (타겟당 1회). 팔 대신 손목 사용 유도
+        wrist_snap_reward = (success_wrist_ang_vel / (self.cfg.wrist_snap_max + 1e-8)).sum(dim=1)  # (N,)
+
         reward = compute_rewards(
             success_reward=success_reward,
             wrong_cost=wrong_cost,
@@ -683,6 +713,7 @@ class RewardComputer:
 
             action_l2=action_l2,
             joint_vel_l2=joint_vel_l2,
+            power_l1=power_l1,
             limit_pen=limit_pen,
             tip_limit_pen=tip_limit_pen,
             under_drum_pen=under_drum_pen,
@@ -700,6 +731,7 @@ class RewardComputer:
             
             w_action=self.cfg.w_action,
             w_joint_vel=self.cfg.w_joint_vel,
+            w_power=self.w_power_eff,
             w_limit=self.cfg.w_limit,
             w_tip_limit=self.cfg.w_tip_limit,
             w_under_drum=self.cfg.w_under_drum,
@@ -707,6 +739,8 @@ class RewardComputer:
             self_col_pen=self_col_pen,
             impact_vel_reward=impact_vel_reward,
             w_impact_vel=self.cfg.w_impact_vel,
+            wrist_snap_reward=wrist_snap_reward,
+            w_wrist_snap=self.cfg.w_wrist_snap,
             off_target_pen=off_target_pen,
             w_off_target=self.cfg.w_off_target,
             crowd_pen=crowd_pen,
@@ -728,6 +762,8 @@ class RewardComputer:
             "downward": downward_reward,
             "action_l2": action_l2,
             "joint_vel_l2": joint_vel_l2,
+            "power_l1": power_l1,
+            "w_power_eff(x1000)": torch.full_like(reward, self.w_power_eff * 1000.0),
             "limit_pen(x100)": limit_pen * 100,
             "tip_limit_pen": tip_limit_pen,
             "under_drum_pen": under_drum_pen,
@@ -736,6 +772,7 @@ class RewardComputer:
             "self_collision_pen": self_col_pen,
             "forearm_dist": forearm_dist,
             "impact_vel": impact_vel_reward,
+            "wrist_snap": wrist_snap_reward,
         }
 
         # 실제 타격 순간만 뽑아 평균 (hit이 난 팔만)
@@ -794,6 +831,15 @@ class RewardComputer:
 
             # 평균 1로 정규화
             self.w_drum_success /= self.w_drum_success.mean()
+
+            # 전체 성공률 EMA로 일률 페널티 게이팅 (헛스윙은 후반 현상 → 나중에 켬)
+            overall_succ = (self.n_success.sum() / (self.n_hit.sum() + eps)).item()
+            beta = self.cfg.w_power_ema_beta
+            self.success_ema = beta * self.success_ema + (1.0 - beta) * overall_succ
+            denom = max(self.cfg.w_power_success_full - self.cfg.w_power_success_start, 1e-6)
+            ramp = (self.success_ema - self.cfg.w_power_success_start) / denom
+            ramp = min(max(ramp, 0.0), 1.0)
+            self.w_power_eff = self.cfg.w_power_max * ramp
 
             # 통계 초기화
             self.n_success.zero_()

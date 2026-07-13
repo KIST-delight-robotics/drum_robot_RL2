@@ -28,7 +28,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     observation_space: int = 94     # 관측 차원
     state_space: int = 0
     action_scale: float = math.pi        # 기본 관절 지령 각속도 상한
-    wrist_action_scale: float = 10.0      # 손목만 상한 크게 (사람처럼 손목 스냅, 실측 ~8.4 rad/s)
+    wrist_action_scale: float = 25.0      # 손목만 상한 크게 (빠른 패시지 ~24 rad/s 커버)
 
     # 관측값 정규화
     joint_vel_scale: float = 5.0

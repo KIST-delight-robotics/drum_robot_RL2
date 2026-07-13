@@ -75,7 +75,11 @@ class RobotInterface:
         usd_vel = robot.data.joint_vel[:, self.ctrl_joint_ids]        # (num_envs, 9)
         joint_vel = self._convert_usd_to_robot(usd_vel)
         return joint_vel
-    
+
+    def get_joint_torque(self, robot: Articulation) -> torch.Tensor:
+        # 액추에이터가 실제로 가한 관절 토크 (N·m). 일률 페널티(|τ·q̇|)용, 제곱/절댓값이라 방향 변환 불필요
+        return robot.data.applied_torque[:, self.ctrl_joint_ids]      # (num_envs, 9)
+
     def clip_and_convert(self, q: torch.Tensor) -> torch.Tensor:
         # clip
         robot_q = torch.max(torch.min(q, self.joint_high), self.joint_low)

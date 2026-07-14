@@ -180,6 +180,7 @@ class DrumRobotEnv(DirectRLEnv):
             drum_pos=drum_pos,
             next_hits=self.next_hits,
             hit_armed=hit_armed.float(),
+            arm_role=self.arm_role,
             )
         
         if torch.isnan(obs).any():
@@ -264,7 +265,7 @@ class DrumRobotEnv(DirectRLEnv):
         wrist_pos = self.robot_interface.get_wrist_pos(self.robot)  # (N, 2, 3)
         elbow_pos = self.robot_interface.get_elbow_pos(self.robot)  # (N, 2, 3)
 
-        reward, log_terms, rate_log_terms = self.reward_computer.compute(
+        reward, log_terms, rate_log_terms, active_arm = self.reward_computer.compute(
             success=success,
             wrong_hit=wrong_hit,
             missed_target=missed_target,
@@ -289,6 +290,9 @@ class DrumRobotEnv(DirectRLEnv):
             target_done=target_done,
         )
 
+        # 팔별 역할 저장 (다음 스텝 관측에 사용 — 보행 위상클럭 격)
+        self.arm_role = active_arm
+
         # 가중치 업데이트
         self.reward_computer.update_difficulty_weights(success=success, missed_target=missed_target)
 
@@ -298,6 +302,13 @@ class DrumRobotEnv(DirectRLEnv):
         track_err = (self.target_joint_pos - current_usd).abs()             # (N, 9)
         log_terms["track_err_rad"] = track_err.mean(dim=-1)                 # 전 관절 평균
         log_terms["track_err_wrist_rad"] = track_err[:, self.wrist_joint_ids].mean(dim=-1)  # 손목만
+
+        # 타이밍 정밀도 진단: 성공 타격의 타겟 시각 오차 (ms). time_error는 |스텝차이|(매칭 안되면 -1)
+        te_valid = (time_error >= 0).float()                                # (N, M)
+        te_ms = time_error.float() * (self.step_dt * 1000.0)                # 스텝 → ms
+        te_sum = (te_ms * te_valid).sum(dim=-1)                             # (N,) 유효분 합
+        te_cnt = te_valid.sum(dim=-1)                                       # (N,) 유효 개수
+        rate_log_terms["avg_time_error_ms"] = torch.stack([te_sum, te_cnt], dim=-1)  # 합/개수 비율
 
         # 로그 출력
         self.logger.add(log_terms)
@@ -356,12 +367,17 @@ class DrumRobotEnv(DirectRLEnv):
         self.obs_dim_drum      = M * 3                 # 드럼 * xyz
         self.obs_dim_next      = K * (M + 2)           # lookahead K개 * (one-hot M + time + valid)
         self.obs_dim_armed     = 2 * M                 # 양손 * 드럼
-        
+        self.obs_dim_role      = 2                     # 팔별 역할 (활성=1/노는팔=0) — 보행 위상클럭 격
+
         obs_dim_total = (
             self.obs_dim_joint_pos + self.obs_dim_joint_vel
             + self.obs_dim_tip + self.obs_dim_drum
             + self.obs_dim_next + self.obs_dim_armed
+            + self.obs_dim_role
         )
+
+        # 팔별 역할 버퍼 (보상 함수 배정에서 갱신, 1스텝 지연으로 관측에 사용)
+        self.arm_role = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.float32)
 
         if obs_dim_total != self.cfg.observation_space:
             raise RuntimeError("observation space dim mismatch.")
@@ -391,12 +407,14 @@ class DrumRobotEnv(DirectRLEnv):
             drum_pos: torch.Tensor,
             next_hits: torch.Tensor,
             hit_armed: torch.Tensor,
+            arm_role: torch.Tensor,
         ) -> torch.Tensor:
         # joint_pos, joint_vel: (N, 9)
         # tip_pos: (N, 2, 3)
         # drum_pos: (N, M, 3)
         # next_hits: (N, K, M+2)
         # hit_armed: (N, 2, M)
+        # arm_role: (N, 2)  활성=1/노는팔=0
 
         # normalize
         joint_pos_n = (joint_pos - self.joint_center) / self.joint_half_range
@@ -419,6 +437,7 @@ class DrumRobotEnv(DirectRLEnv):
                 drum_pos_n.reshape(self.num_envs, self.obs_dim_drum),
                 next_hits.reshape(self.num_envs, self.obs_dim_next),
                 hit_armed.reshape(self.num_envs, self.obs_dim_armed),
+                arm_role.reshape(self.num_envs, self.obs_dim_role),
             ],
             dim=-1
         )
@@ -437,3 +456,6 @@ class DrumRobotEnv(DirectRLEnv):
     def _reset_tensors(self, env_ids: torch.Tensor):
         # 스텝 리셋
         self.steps[env_ids] = 0
+
+        # 팔별 역할 리셋 (에피소드 시작 시 stale 값 방지)
+        self.arm_role[env_ids] = 0.0

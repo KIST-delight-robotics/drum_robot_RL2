@@ -37,13 +37,17 @@ def compute_arm_target_assignment(
         drum_pos: torch.Tensor,     # (N, M, 3)
         left_tip_pos: torch.Tensor, # (N, 3)
         right_tip_pos: torch.Tensor,# (N, 3)
+        left_elbow_pos: torch.Tensor,  # (N, 3)  배정 기준 (팔꿈치=자기 쪽에 안정적)
+        right_elbow_pos: torch.Tensor, # (N, 3)
         tip_vel: torch.Tensor,      # (N, 2, 3)
         hit_armed: torch.Tensor,    # (N, 2, M)
         k_align: float,
-        w_free_arm: float,          # 노는 팔의 h1 이동 가중치
+        w_free_arm: float,          # (미사용, 하위호환용) 예전 h1 lookahead 가중치
         hit_xy_radius: float,       # crowd 판정용 타격영역 XY 반경
         hit_z_range: float,         # crowd 판정용 타격영역 Z 범위
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ready_height: float,        # 노는 팔 준비 높이 (드럼 위, off_target 밴드보다 위)
+        k_ready: float,             # ready-pose 보상 감쇠 계수
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = target_mask.device
     N, M = target_mask.shape
 
@@ -103,6 +107,18 @@ def compute_arm_target_assignment(
     dz_l0 = diff_l[:, :, 2].gather(1, idx0).squeeze(1)
     dz_r0 = diff_r[:, :, 2].gather(1, idx0).squeeze(1)
 
+    # 배정 기준: 팔꿈치(elbow) 3D 제곱거리. 팁은 크로스되기 쉬우나 elbow는 자기 쪽에 안정적
+    diff_e_l = left_elbow_pos[:, None, :] - drum_pos    # (N, M, 3)
+    diff_e_r = right_elbow_pos[:, None, :] - drum_pos
+    dist_e_l = torch.sum(diff_e_l * diff_e_l, dim=-1)   # (N, M)
+    dist_e_r = torch.sum(diff_e_r * diff_e_r, dim=-1)
+    de_l0 = dist_e_l.gather(1, idx0).squeeze(1)         # 왼 elbow → h0(=target0)
+    de_r0 = dist_e_r.gather(1, idx0).squeeze(1)
+    de_l1 = dist_e_l.gather(1, idx1).squeeze(1)         # 왼 elbow → target1 (case 2용)
+    de_r1 = dist_e_r.gather(1, idx1).squeeze(1)
+    de_l_h1 = dist_e_l.gather(1, idx_h1).squeeze(1)     # 왼 elbow → h1
+    de_r_h1 = dist_e_r.gather(1, idx_h1).squeeze(1)
+
     # --------------------
 
     # 정렬 게이트 (타겟 위=1, 멀수록 0). downward 보상에만 사용
@@ -144,16 +160,10 @@ def compute_arm_target_assignment(
     # --------------------
     one_mask = (target_count == 1)
 
-    # 노는 팔의 h1 이동 비용 (h1 없으면 0 → 기존 단일 배정과 동일)
-    free_r_h1 = d_r_h1 * h1_exist.float()   # 오른팔이 노는 경우
-    free_l_h1 = d_l_h1 * h1_exist.float()   # 왼팔이 노는 경우
-
-    # 두 팔을 {h0, h1}에 최적 매칭 (case 2와 동일 원리, 순차 타격 버전)
-    cost_A = d_l0 + w_free_arm * free_r_h1   # 왼팔→h0, 오른팔→h1
-    cost_B = d_r0 + w_free_arm * free_l_h1   # 오른팔→h0, 왼팔→h1
-
-    use_left = cost_A <= cost_B              # 왼팔이 h0 담당
-    one_cost = torch.where(use_left, cost_A, cost_B)
+    # h0 배정: elbow가 h0에 더 가까운 팔 (lookahead 없음 → 몸 가로지르는 크로스 제거)
+    use_left = de_l0 <= de_r0                # 왼팔 elbow가 h0에 더 가까움
+    # 접근/진척 보상용 비용은 담당 팔의 팁-h0 거리 (팁이 실제로 드럼에 닿아야 하므로)
+    one_cost = torch.where(use_left, d_l0, d_r0)
     cost = torch.where(one_mask, one_cost, cost)
 
     # up/down(타격)은 h0 담당 팔만. 노는 팔은 cost(이동)로만 h1 유도.
@@ -194,7 +204,8 @@ def compute_arm_target_assignment(
     two_cost = torch.minimum(cost_case1, cost_case2)
     cost = torch.where(two_mask, two_cost, cost)
 
-    use_case1 = cost_case1 <= cost_case2
+    # 매칭 결정은 elbow 기준 (팁 크로스 방지), 비용은 위의 팁 기준 two_cost 유지
+    use_case1 = (de_l0 + de_r1) <= (de_l1 + de_r0)
 
     two_upward_reward = torch.where(
         use_case1,
@@ -218,7 +229,37 @@ def compute_arm_target_assignment(
     # 나중에 필요하면 작성
     #
 
-    return cost, upward_reward, downward_reward, crowd_pen
+    # --------------------
+    # 팔별 역할 (관측 신호용) + 노는 팔 ready-pose 보상
+    # --------------------
+    active_arm_l = torch.zeros(N, device=device)
+    active_arm_r = torch.zeros(N, device=device)
+    # case 1: h0 담당 팔만 활성
+    active_arm_l = torch.where(one_mask, use_left.float(), active_arm_l)
+    active_arm_r = torch.where(one_mask, (~use_left).float(), active_arm_r)
+    # case 2: 양팔 모두 활성
+    active_arm_l = torch.where(two_mask, torch.ones_like(active_arm_l), active_arm_l)
+    active_arm_r = torch.where(two_mask, torch.ones_like(active_arm_r), active_arm_r)
+    active_arm = torch.stack([active_arm_l, active_arm_r], dim=1)   # (N, 2)  1=활성, 0=노는팔
+
+    # ready-pose: case 1의 노는 팔이 "다음 드럼 위 준비높이"에 hover하도록 (수직 흔들림 억제)
+    ready_pose_reward = torch.zeros(N, device=device)
+    idle_dxy_h1 = torch.where(use_left, d_r_h1, d_l_h1)                     # 노는 팔의 h1까지 XY 제곱거리
+    idle_tip_z  = torch.where(use_left, right_tip_pos[:, 2], left_tip_pos[:, 2])
+    drum_z_h1 = drum_pos[:, :, 2].gather(1, idx_h1).squeeze(1)
+    drum_z_h0 = drum_pos[:, :, 2].gather(1, idx0).squeeze(1)
+    ref_z = torch.where(h1_exist, drum_z_h1, drum_z_h0) + ready_height     # h1 없으면 h0 기준 높이 유지(home)
+    z_err = idle_tip_z - ref_z
+    # h1이 "노는 팔 영역"일 때만 XY로 당김 (노는 elbow가 h1에 더 가까움). 같은-쪽 연타면 노는 팔은 안 건너오고 높이만 유지(home)
+    idle_e_h1   = torch.where(use_left, de_r_h1, de_l_h1)   # 노는 팔 elbow → h1
+    active_e_h1 = torch.where(use_left, de_l_h1, de_r_h1)   # 치는 팔 elbow → h1
+    idle_owns_h1 = h1_exist & (idle_e_h1 <= active_e_h1)
+    xy_term = torch.where(idle_owns_h1, idle_dxy_h1, torch.zeros_like(idle_dxy_h1))
+    ready_sq = xy_term + z_err * z_err
+    one_ready = torch.exp(-k_ready * ready_sq)
+    ready_pose_reward = torch.where(one_mask, one_ready, ready_pose_reward)
+
+    return cost, upward_reward, downward_reward, crowd_pen, active_arm, ready_pose_reward
 
 @torch.jit.script
 def _proximity_terms(
@@ -226,6 +267,8 @@ def _proximity_terms(
         right_tip_pos: torch.Tensor,
         prev_left_tip_pos: torch.Tensor,
         prev_right_tip_pos: torch.Tensor,
+        left_elbow_pos: torch.Tensor,
+        right_elbow_pos: torch.Tensor,
         drum_pos: torch.Tensor,
         next_hits: torch.Tensor,
         tip_vel: torch.Tensor,
@@ -236,7 +279,9 @@ def _proximity_terms(
         w_free_arm: float,
         hit_xy_radius: float,
         hit_z_range: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ready_height: float,
+        k_ready: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = drum_pos.shape[1]
 
     nearest_target_mask = next_hits[:, 0, :M] > 0.5   # h0
@@ -248,31 +293,39 @@ def _proximity_terms(
     h1_same_as_h0 = (h1_mask == nearest_target_mask).all(dim=1)   # (N,)
     second_target_mask = torch.where(h1_same_as_h0.unsqueeze(1), h2_mask, h1_mask)
 
-    curr_cost, upward_reward, downward_reward, crowd_pen = compute_arm_target_assignment(
+    curr_cost, upward_reward, downward_reward, crowd_pen, active_arm, ready_pose_reward = compute_arm_target_assignment(
         target_mask=nearest_target_mask,
         second_target_mask=second_target_mask,
         drum_pos=drum_pos,
         left_tip_pos=left_tip_pos,
         right_tip_pos=right_tip_pos,
+        left_elbow_pos=left_elbow_pos,
+        right_elbow_pos=right_elbow_pos,
         tip_vel=tip_vel,
         hit_armed=hit_armed,
         k_align=k_align,
         w_free_arm=w_free_arm,
         hit_xy_radius=hit_xy_radius,
         hit_z_range=hit_z_range,
+        ready_height=ready_height,
+        k_ready=k_ready,
     )
-    prev_cost, _, _, _ = compute_arm_target_assignment(
+    prev_cost, _, _, _, _, _ = compute_arm_target_assignment(
         target_mask=nearest_target_mask,
         second_target_mask=second_target_mask,
         drum_pos=drum_pos,
         left_tip_pos=prev_left_tip_pos,
         right_tip_pos=prev_right_tip_pos,
+        left_elbow_pos=left_elbow_pos,
+        right_elbow_pos=right_elbow_pos,
         tip_vel=tip_vel,
         hit_armed=hit_armed,
         k_align=k_align,
         w_free_arm=w_free_arm,
         hit_xy_radius=hit_xy_radius,
         hit_z_range=hit_z_range,
+        ready_height=ready_height,
+        k_ready=k_ready,
     )
 
     proximity_cost = torch.exp(-k_time_to_hit * first_time) * curr_cost
@@ -282,7 +335,7 @@ def _proximity_terms(
     done_nearest = (target_done & nearest_target_mask).any(dim=1)   # (N,)
     downward_reward = downward_reward * (~done_nearest).float()
 
-    return proximity_cost, progress_reward, upward_reward, downward_reward, crowd_pen
+    return proximity_cost, progress_reward, upward_reward, downward_reward, crowd_pen, active_arm, ready_pose_reward
 
 @torch.jit.script
 def _self_collision_penalty(
@@ -402,7 +455,7 @@ def _global_penalties(
     action_l2 = torch.sum(action_weight * action * action, dim=-1)
     joint_vel_l2 = torch.sum(joint_vel_weight * joint_vel * joint_vel, dim=-1)
 
-    # 기계적 일률 |τ·q̇| (W). 무게 인지적(무거운 팔 가속=고일률) + 유지 자세는 공짜(q̇≈0).
+    # 기계적 일률 |τ·q̇| (W). 무거운 팔 가속=고일률 + 유지 자세는 공짜(q̇≈0).
     # 손목은 가벼워 물리적으로 저렴하므로 별도 배율 없이 균일 합산
     power_l1 = torch.sum(torch.abs(joint_torque * joint_vel), dim=-1)
 
@@ -459,6 +512,10 @@ def compute_rewards(
         w_off_target: float,
         crowd_pen: torch.Tensor,
         w_crowd: float,
+        waist_vel_pen: torch.Tensor,
+        w_waist: float,
+        ready_pose_reward: torch.Tensor,
+        w_ready: float,
 ) -> torch.Tensor:
     reward = (
         w_success * success_reward
@@ -484,6 +541,8 @@ def compute_rewards(
         - w_self_collision * self_col_pen
         - w_off_target * off_target_pen
         - w_crowd * crowd_pen
+        - w_waist * waist_vel_pen
+        + w_ready * ready_pose_reward
     )
     return reward
 
@@ -496,6 +555,11 @@ class RewardComputerCfg:
     k_time_to_hit: float = 3.0
     k_align: float = 40.0   # downward 보상 XY 정렬 게이트 (XY 제곱거리 기준, 13cm≈0.51)
     w_free_arm: float = 0.5 # 노는 팔을 다음 타격(h1)으로 유도하는 이동 가중치
+
+    # 노는 팔 ready-pose (다음 드럼 위 준비높이 hover → 수직 헛스윙 억제). 역할 관측과 함께 작동
+    w_ready: float = 0.3         # ready-pose 보상 가중치
+    ready_height: float = 0.18   # 드럼 위 준비 높이 [m] (off_target 밴드 0.12보다 위)
+    k_ready: float = 10.0        # ready-pose 보상 감쇠 (3D 제곱거리 기준)
 
     # 타격영역 판정 (hit_detector와 동일). crowd_pen 등에 사용
     hit_xy_radius: float = 0.13
@@ -539,10 +603,13 @@ class RewardComputerCfg:
     w_joint_vel: float = 0.0001
     w_wrist_vel_scale: float = 0.001  # 손목 관절 속도 페널티 배율 (스윙 위해 완화)
     # 기계적 일률 |τ·q̇| 페널티. 헛스윙은 후반 현상이므로 성공률 게이팅으로 나중에 켬 (초기 탐색 방해 방지)
-    w_power_max: float = 0.005          # 램프 최대치 (성공률 full 이상에서 도달)
+    w_power_max: float = 0.05          # 램프 최대치 (성공률 full 이상에서 도달)
     w_power_success_start: float = 0.6  # 이 성공률(EMA)부터 페널티 켜기 시작
     w_power_success_full: float = 0.85  # 이 성공률(EMA)에서 최대치 도달
     w_power_ema_beta: float = 0.9       # 성공률 EMA 평활 계수
+
+    # 전용 허리 속도 페널티 Σ(허리 각속도)². 몸통 고정 유도. 위 성공률 램프 재사용(w_waist_eff)
+    w_waist_max: float = 0.1            # 램프 최대치. 작게 시작 → waist_vel_pen 로그로 보정, 먼 드럼 감시
     w_limit: float = 0.5
     w_tip_limit: float = 0.15
     w_under_drum: float = 0.1 #0.08
@@ -586,8 +653,19 @@ class RewardComputer:
             device=self.device, dtype=torch.long,
         )
 
-        # 일률 페널티 성공률 게이팅 상태 (초기엔 꺼짐 → 성공률 오르면 램프인)
+        # 허리/어깨 각속도 인덱스 (진단 로그용 — 무거운 관절 움직임 모니터)
+        self.waist_ids = torch.tensor(
+            [i for i, n in enumerate(ctrl_joint_names) if "waist" in n],
+            device=self.device, dtype=torch.long,
+        )
+        self.shoulder_ids = torch.tensor(
+            [i for i, n in enumerate(ctrl_joint_names) if "shoulder" in n],
+            device=self.device, dtype=torch.long,
+        )
+
+        # 일률/허리 페널티 성공률 게이팅 상태 (초기엔 꺼짐 → 성공률 오르면 램프인)
         self.w_power_eff = 0.0
+        self.w_waist_eff = 0.0
         self.success_ema = 0.0
 
         # 악기별 보상 가중치
@@ -622,7 +700,7 @@ class RewardComputer:
             success_impact_vel: torch.Tensor,  # (N, M) 성공한 타격의 하강 속도
             success_wrist_ang_vel: torch.Tensor,  # (N, M) 성공한 타격의 손목 각속도
             target_done: torch.Tensor,  # (N, M) 유효 타격 완료된 타겟 (재타 downward 억제)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, dict, dict, torch.Tensor]:  # reward, log, rate_log, active_arm(N,2)
         # goal
         success_reward, wrong_cost, missed_cost, time_accuracy_reward = _goal_terms(
             success=success,
@@ -634,11 +712,13 @@ class RewardComputer:
         )
 
         # proximity / progress / arm assignment / crowd
-        proximity_cost, progress_reward, upward_reward, downward_reward, crowd_pen = _proximity_terms(
+        proximity_cost, progress_reward, upward_reward, downward_reward, crowd_pen, active_arm, ready_pose_reward = _proximity_terms(
             left_tip_pos=tip_pos[:, 0, :],
             right_tip_pos=tip_pos[:, 1, :],
             prev_left_tip_pos=prev_tip_pos[:, 0, :],
             prev_right_tip_pos=prev_tip_pos[:, 1, :],
+            left_elbow_pos=elbow_pos[:, 0, :],
+            right_elbow_pos=elbow_pos[:, 1, :],
             drum_pos=drum_pos,
             next_hits=next_hits,
             tip_vel=tip_vel,
@@ -649,6 +729,8 @@ class RewardComputer:
             w_free_arm=self.cfg.w_free_arm,
             hit_xy_radius=self.cfg.hit_xy_radius,
             hit_z_range=self.cfg.hit_z_range,
+            ready_height=self.cfg.ready_height,
+            k_ready=self.cfg.k_ready,
         )
 
         # off-target 페널티에서 제외할 현재 타겟 마스크 (h0)
@@ -699,6 +781,10 @@ class RewardComputer:
         # wrist snap: 성공한 타격의 손목 각속도에 보상 (타겟당 1회). 팔 대신 손목 사용 유도
         wrist_snap_reward = (success_wrist_ang_vel / (self.cfg.wrist_snap_max + 1e-8)).sum(dim=1)  # (N,)
 
+        # 전용 허리 속도 페널티: 몸통 고정 유도. 성공률 게이팅(w_waist_eff)이라 초기 리치 학습 방해 없음
+        waist_vel = robot_vel[:, self.waist_ids]                          # (N, n_waist)
+        waist_vel_pen = torch.sum(waist_vel * waist_vel, dim=-1)          # (N,)
+
         reward = compute_rewards(
             success_reward=success_reward,
             wrong_cost=wrong_cost,
@@ -745,6 +831,10 @@ class RewardComputer:
             w_off_target=self.cfg.w_off_target,
             crowd_pen=crowd_pen,
             w_crowd=self.cfg.w_crowd,
+            waist_vel_pen=waist_vel_pen,
+            w_waist=self.w_waist_eff,
+            ready_pose_reward=ready_pose_reward,
+            w_ready=self.cfg.w_ready,
         )
 
         num_hit_drum = success.float() + missed_target.float()
@@ -764,6 +854,11 @@ class RewardComputer:
             "joint_vel_l2": joint_vel_l2,
             "power_l1": power_l1,
             "w_power_eff(x1000)": torch.full_like(reward, self.w_power_eff * 1000.0),
+            "waist_ang_vel": robot_vel[:, self.waist_ids].abs().mean(dim=-1),
+            "shoulder_ang_vel": robot_vel[:, self.shoulder_ids].abs().mean(dim=-1),
+            "waist_vel_pen": waist_vel_pen,
+            "w_waist_eff(x100)": torch.full_like(reward, self.w_waist_eff * 100.0),
+            "ready_pose": ready_pose_reward,
             "limit_pen(x100)": limit_pen * 100,
             "tip_limit_pen": tip_limit_pen,
             "under_drum_pen": under_drum_pen,
@@ -805,7 +900,7 @@ class RewardComputer:
             rate_log_terms[f"{name}_miss_rate"]    = torch.stack([missed_target[:, i], num_hit_drum[:, i]], dim=-1)
             rate_log_terms[f"{name}_impact_vel"]   = torch.stack([vel_per_drum[:, i], hit_per_drum[:, i]], dim=-1)
 
-        return reward, log_terms, rate_log_terms
+        return reward, log_terms, rate_log_terms, active_arm
     
     def update_difficulty_weights(
             self,
@@ -840,6 +935,7 @@ class RewardComputer:
             ramp = (self.success_ema - self.cfg.w_power_success_start) / denom
             ramp = min(max(ramp, 0.0), 1.0)
             self.w_power_eff = self.cfg.w_power_max * ramp
+            self.w_waist_eff = self.cfg.w_waist_max * ramp   # 전용 허리 페널티도 동일 게이팅
 
             # 통계 초기화
             self.n_success.zero_()

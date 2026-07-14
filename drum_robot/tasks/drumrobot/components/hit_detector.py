@@ -18,7 +18,7 @@ class HitDetectorCfg:
     drum_z_range: float = 0.07
     min_impact_velocity: float = 0.2
     rearm_height: float = 0.18
-    hit_window_step: int = 10
+    hit_window_step: int = 3
 
 class HitDetector:
     def __init__(

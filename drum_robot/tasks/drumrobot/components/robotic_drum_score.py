@@ -54,6 +54,10 @@ class RDSCfg:
     # 랜덤 생성 시 동시 타격(좌우 쌍) 비율. 0.0=단일만(1단계), 0.2~=2단계
     double_hit_ratio: float = 0.1
 
+    # 에피소드당 타격 수 K 랜덤화 (K~[k_min, k_max], k_max = k_ratio × 물리적 최대). 간격도 랜덤 분배
+    k_min: int = 4            # 최소 타격 수 (너무 적으면 학습신호 빈약)
+    k_ratio: float = 0.5      # k_max = k_ratio × K_abs. 낮을수록 성기고 간격 자유↑ (병목 회피). 안정되면 ↑ (상한 ~0.7)
+
     note_to_drum_idx: dict = field(default_factory=lambda: {
         "Acoustic Snare": 0,
         "Electric Snare": 0,
@@ -445,48 +449,56 @@ class RDS:
         N = len(env_ids)
         T = self.env.episode_length_step
         M = self.num_drums
+        device = self.device
 
-        rds_rand = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
+        rds_rand = torch.zeros((N, T, M), device=device, dtype=torch.int64)
 
         s = self.cfg.start_offset_steps
-        e = T - self.env.hit_window_step
-
-        k = 10
-        ### 윈도우 겹침 문제 해결 - 새로운 변수 정의############################
         W = self.env.hit_window_step
-        min_gap = 2*W+1
-        hit_zone_width = max(1, (e - s - (k - 1) * min_gap) // k)
-        #################################################################
+        e = T - W
+        min_gap = 2 * W + 1          # 윈도우 겹침 방지 (인접 타격 최소 간격)
+        span = e - s
 
-        for i in range(k):
-            #si = (int)(s + (2 * i) * (e - s) / (2 * k - 1))
-            #ei = (int)(s + (2 * i + 1) * (e - s) / (2 * k - 1)) 
-            #time_rand = torch.randint(si, ei, (N,), device=self.device) #기존코드
+        # 배치 가능한 절대 최대 K, 그 중 여유를 둔 k_max (병목 회피 — k_max에서도 간격 흔들 slack 유지)
+        K_abs = max(1, span // min_gap)
+        k_max = max(self.cfg.k_min, int(self.cfg.k_ratio * K_abs))
+        k_min = min(self.cfg.k_min, k_max)
 
-            ###########################윈도우 겹침 문제 해결###########################
-            si = s + i * (hit_zone_width + min_gap)
-            ei = si + hit_zone_width
-            if ei > e:
-                break
-            time_rand = torch.randint(si, max(si + 1, ei), (N,), device=self.device)
-            ########################################################################
+        # env별 타격 수 K 랜덤
+        K_env = torch.randint(k_min, k_max + 1, (N,), device=device)          # (N,)
 
-            env = torch.arange(N, device=self.device)
+        # K개를 [s, e)에 배치: 필수 간격 min_gap + 남는 여유(slack)를 랜덤 분배 (간격 랜덤화)
+        col = torch.arange(k_max, device=device).unsqueeze(0)                 # (1, k_max)
+        place_mask = col < K_env.unsqueeze(1)                                 # (N, k_max)
+
+        u = torch.rand(N, k_max, device=device)
+        u = torch.where(place_mask, u, torch.full_like(u, 2.0))               # 미사용 슬롯은 정렬 뒤로
+        u_sorted, _ = torch.sort(u, dim=1)                                    # 유효분 오름차순 → 앞쪽 배치
+
+        available = (span - (K_env - 1) * min_gap).clamp(min=0).float()       # (N,) K개 넣고 남는 여유
+        extra = torch.floor(u_sorted * available.unsqueeze(1)).long()         # (N, k_max) 비감소 정수 → 간격≥min_gap 보장
+        times = (s + extra + col * min_gap).clamp(0, e - 1)                   # (N, k_max) 타격 시각
+
+        env = torch.arange(N, device=device)
+        P = self.double_pairs.shape[0]
+        for i in range(k_max):
+            m = place_mask[:, i]
+            ti = times[:, i]
 
             # env별 단일/동시 결정
-            is_double = torch.rand(N, device=self.device) < self.cfg.double_hit_ratio
+            is_double = torch.rand(N, device=device) < self.cfg.double_hit_ratio
+            single_mask = m & (~is_double)
+            double_mask = m & is_double
 
             # 단일 타격: 아무 드럼 하나
-            drum_single = torch.randint(0, M, (N,), device=self.device)
-            single_mask = ~is_double
-            rds_rand[env[single_mask], time_rand[single_mask], drum_single[single_mask]] = 1
+            drum_single = torch.randint(0, M, (N,), device=device)
+            rds_rand[env[single_mask], ti[single_mask], drum_single[single_mask]] = 1
 
             # 동시 타격: 좌우 쌍에서 하나 뽑아 두 드럼
-            P = self.double_pairs.shape[0]
             if P > 0:
-                pair_idx = torch.randint(0, P, (N,), device=self.device)
+                pair_idx = torch.randint(0, P, (N,), device=device)
                 pair = self.double_pairs[pair_idx]   # (N, 2)
-                rds_rand[env[is_double], time_rand[is_double], pair[is_double, 0]] = 1
-                rds_rand[env[is_double], time_rand[is_double], pair[is_double, 1]] = 1
+                rds_rand[env[double_mask], ti[double_mask], pair[double_mask, 0]] = 1
+                rds_rand[env[double_mask], ti[double_mask], pair[double_mask, 1]] = 1
 
         return rds_rand

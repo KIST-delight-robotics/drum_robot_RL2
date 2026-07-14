@@ -600,8 +600,10 @@ class RewardComputerCfg:
 
     w_action: float = 0.0003
     w_wrist_action_scale: float = 0.001  # 손목 action 페널티 배율 (손목 스냅 위해 완화)
+    w_elbow_action_scale: float = 0.001  # 팔꿈치 action 페널티 배율 (자연스러운 굽힘 위해 완화)
     w_joint_vel: float = 0.0001
     w_wrist_vel_scale: float = 0.001  # 손목 관절 속도 페널티 배율 (스윙 위해 완화)
+    w_elbow_vel_scale: float = 0.001  # 팔꿈치 관절 속도 페널티 배율 (자연스러운 굽힘 위해 완화)
     # 기계적 일률 |τ·q̇| 페널티. 헛스윙은 후반 현상이므로 성공률 게이팅으로 나중에 켬 (초기 탐색 방해 방지)
     w_power_max: float = 0.05          # 램프 최대치 (성공률 full 이상에서 도달)
     w_power_success_start: float = 0.6  # 이 성공률(EMA)부터 페널티 켜기 시작
@@ -632,16 +634,22 @@ class RewardComputer:
         instruments = Instruments()
         self.drum_names = list(instruments.all.keys())
 
-        # 관절 속도 페널티 가중치 (손목만 완화). ctrl_joint_names는 resolve된 순서
-        vel_w = [self.cfg.w_wrist_vel_scale if "wrist" in name else 1.0
-                 for name in ctrl_joint_names]
+        # 관절 속도 페널티 가중치 (손목·팔꿈치 완화 → 원위 관절로 자연스럽게 침). ctrl_joint_names는 resolve된 순서
+        def _vel_scale(name: str) -> float:
+            if "wrist" in name: return self.cfg.w_wrist_vel_scale
+            if "elbow" in name: return self.cfg.w_elbow_vel_scale
+            return 1.0
+        vel_w = [_vel_scale(name) for name in ctrl_joint_names]
         self.joint_vel_weight = torch.tensor(
             vel_w, device=self.device, dtype=torch.float32
         ).unsqueeze(0)  # (1, 9)
 
-        # action 페널티 가중치 (손목만 완화). 손목 스냅 위해 손목 action에 세금 감면
-        act_w = [self.cfg.w_wrist_action_scale if "wrist" in name else 1.0
-                 for name in ctrl_joint_names]
+        # action 페널티 가중치 (손목·팔꿈치 완화). 원위 관절 스냅/굽힘 위해 세금 감면
+        def _act_scale(name: str) -> float:
+            if "wrist" in name: return self.cfg.w_wrist_action_scale
+            if "elbow" in name: return self.cfg.w_elbow_action_scale
+            return 1.0
+        act_w = [_act_scale(name) for name in ctrl_joint_names]
         self.action_weight = torch.tensor(
             act_w, device=self.device, dtype=torch.float32
         ).unsqueeze(0)  # (1, 9)

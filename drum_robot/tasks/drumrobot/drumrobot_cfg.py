@@ -62,19 +62,36 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
             joint_pos={"(.*)": 0.0}, 
         ),
         prim_path=PRIM_PATH,
+        # 실기(motors.json + 데이터시트) 기준 관절별 actuator.
+        #   waist: TMotor AK10_9 (gear 9),  arm: TMotor AK70_10 (gear 10),  wrist: Maxon DCX22L+GPX22HP (gear 35)
+        #   팔 stiffness/damping은 실기 TMotor 서보(control_gain) → 단순 PD 환산 불가라 위치추종용 값 유지.
+        #   effort/velocity_limit는 데이터시트 근사(팔은 T-Motor/CubeMars 공개값, 손목은 Maxon 데이터시트 확정값).
         actuators={
-            "drum_joints": ImplicitActuatorCfg(
-                joint_names_expr=["waist_joint",
-            "right_shoulder_1",
-            "left_shoulder_1",
-            "right_shoulder_2",
-            "right_elbow",
-            "left_shoulder_2",
-            "left_elbow",
-            "right_wrist",
-            "left_wrist",],         # 필요시 모든 관절을 제어 대상으로 설정 joint_names_expr=[".*"]
-                stiffness=200.0,    # 벨로시티 제어 시 일반적으로 0
-                damping=10.0,       # 댐핑값은 로봇 무게에 맞춰 조절
+            "waist": ImplicitActuatorCfg(
+                joint_names_expr=["waist_joint"],
+                stiffness=200.0,
+                damping=10.0,
+                effort_limit=48.0,      # AK10_9 peak torque ~48 N·m (근사, 확인 권장)
+                velocity_limit=28.0,    # AK10_9 no-load ~28 rad/s (근사)
+            ),
+            "arm": ImplicitActuatorCfg(
+                joint_names_expr=[
+                    "right_shoulder_1", "left_shoulder_1",
+                    "right_shoulder_2", "left_shoulder_2",
+                    "right_elbow", "left_elbow",
+                ],
+                stiffness=200.0,
+                damping=10.0,
+                effort_limit=24.0,      # AK70_10 peak torque ~24.8 N·m (current_limit 23.2A와 정합)
+                velocity_limit=46.0,    # AK70_10 no-load ~46 rad/s (근사)
+            ),
+            "wrist": ImplicitActuatorCfg(
+                joint_names_expr=["right_wrist", "left_wrist"],
+                stiffness=2.1,          # 실기 CST: kp(60) × gear(35) — 컴플라이언트 (기존 균일 200과 정반대)
+                damping=0.035,          # 실기: kd(1) × gear(35)
+                effort_limit=2.5,       # GPX22HP 단속 허용토크 2.4 N·m (기어헤드가 병목; 모터 stall 294mNm보다 낮음)
+                velocity_limit=30.0,    # 기어 최대 입력 10000rpm / 35 ≈ 30 rad/s (연속 8000rpm→24)
+                armature=1.1e-3,        # 반사 로터관성 = I_rotor(8.85 gcm²) × gear²(35²) ≈ 1.08e-3 kg·m²
             ),
         },
     )

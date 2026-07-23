@@ -53,6 +53,9 @@ class DrumRobotEnv(DirectRLEnv):
         N = self.num_envs
         self.steps = torch.zeros((N,), device=self.device, dtype=torch.int64)
 
+        # 전역 정책 스텝 카운터 (MIDI 커리큘럼 램프용 — 매 _get_dones에서 +1)
+        self.global_step = 0
+
         # drum
         self.instruments = Instruments()
         self.default_drum_pos = torch.tensor(
@@ -65,7 +68,11 @@ class DrumRobotEnv(DirectRLEnv):
 
         # spec
         hit_detector_cfg = HitDetectorCfg()
-        rds_cfg = RDSCfg()
+        rds_cfg = RDSCfg(
+            eval_midi_file=self.cfg.eval_midi_file,   # 평가용 (기본 "" → 학습과 동일)
+            eval_full_song=self.cfg.eval_full_song,
+            slow_factor=self.cfg.eval_slow_factor,    # 기본 1.5=학습과 동일. play1에서 override 가능
+        )
         max_lookahead_step = int(rds_cfg.max_lookahead_s / self.step_dt)
         env_specs = EnvRuntimeSpec(
             num_envs=self.num_envs,
@@ -99,6 +106,14 @@ class DrumRobotEnv(DirectRLEnv):
             [name_to_idx["left_wrist"], name_to_idx["right_wrist"]],
             device=self.device, dtype=torch.long,
         )
+        # 팔꿈치 관절 인덱스 [왼, 오] — 세기별 리프트 목표 매칭용 (자연스러운 "들었다 내리치기") [[intensity-teaching-design]]
+        self.elbow_joint_ids = torch.tensor(
+            [name_to_idx["left_elbow"], name_to_idx["right_elbow"]],
+            device=self.device, dtype=torch.long,
+        )
+        # 리프트 baseline(직전 타격 팔꿈치각) + 스윙 중 리프트 apex(최대) 추적 버퍼
+        self.elbow_baseline = torch.zeros((self.num_envs, 2), device=self.device)
+        self.elbow_apex_buf = torch.zeros((self.num_envs, 2), device=self.device)
 
         # RDS
         self.rds = RDS(
@@ -214,6 +229,9 @@ class DrumRobotEnv(DirectRLEnv):
         self.robot.set_joint_position_target(self.target_joint_pos, joint_ids=ctrl_joint_ids)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # 전역 스텝 (MIDI 커리큘럼 램프)
+        self.global_step += 1
+
         # episode time out
         self.steps = self.steps + 1
         time_out = self.steps >= self.episode_length_step - 1
@@ -243,21 +261,39 @@ class DrumRobotEnv(DirectRLEnv):
         wrist_vel_abs = robot_vel[:, self.wrist_joint_ids].abs()                # (N, 2)
         hit_wrist_per_drum = (hit_per_arm.float() * wrist_vel_abs[:, :, None]).max(dim=1).values  # (N, M)
 
-        # 타격 시간/속도/손목각속도 기록
-        self.rds.set_rds_visit(steps=self.steps, hit_mask=hit_mask, hit_vel=hit_vel_per_drum, hit_wrist=hit_wrist_per_drum)
+        # 팔꿈치 리프트: baseline(직전 타격 팔꿈치각) 대비 |현재각|. 스윙 중 apex(최대) 추적 → "얼마나 높이 들었나"
+        elbow_angle = robot_pos[:, self.elbow_joint_ids]                        # (N, 2)
+        elbow_lift = (elbow_angle - self.elbow_baseline).abs()                  # (N, 2)
+        self.elbow_apex_buf = torch.maximum(self.elbow_apex_buf, elbow_lift)    # (N, 2) running max
+        hit_elbow_apex_per_drum = (hit_per_arm.float() * self.elbow_apex_buf[:, :, None]).max(dim=1).values  # (N, M)
+
+        # 타격 시간/속도/손목각속도/팔꿈치리프트apex 기록
+        self.rds.set_rds_visit(
+            steps=self.steps, hit_mask=hit_mask,
+            hit_vel=hit_vel_per_drum, hit_wrist=hit_wrist_per_drum, hit_elbow_apex=hit_elbow_apex_per_drum,
+        )
+
+        # 다음 사이클 위해 타격한 팔의 baseline 갱신 + apex 리셋 (리프트 계산 후에)
+        hit_arm_any = hit_per_arm.any(dim=-1)                                   # (N, 2)
+        self.elbow_baseline = torch.where(hit_arm_any, elbow_angle, self.elbow_baseline)
+        self.elbow_apex_buf = torch.where(hit_arm_any, torch.zeros_like(self.elbow_apex_buf), self.elbow_apex_buf)
 
         # 결과
         rds = self.rds.get_rds()
         rds_visit = self.rds.get_rds_visit()
         rds_visit_vel = self.rds.get_rds_visit_vel()
         rds_visit_wrist = self.rds.get_rds_visit_wrist()
-        success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_done = self.hit_detector.get_result(
+        rds_visit_elbow_apex = self.rds.get_rds_visit_elbow_apex()
+        rds_T = self.rds.get_rds_T()
+        success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_done, target_velocity, success_elbow_apex, target_T = self.hit_detector.get_result(
             hit_mask=hit_mask,
             steps=self.steps,
             rds=rds,
             rds_visit=rds_visit,
             rds_visit_vel=rds_visit_vel,
             rds_visit_wrist=rds_visit_wrist,
+            rds_visit_elbow_apex=rds_visit_elbow_apex,
+            rds_T=rds_T,
         )
 
         joint_low, joint_high = self.robot_interface.get_limit()
@@ -288,6 +324,9 @@ class DrumRobotEnv(DirectRLEnv):
             success_impact_vel=success_impact_vel,
             success_wrist_ang_vel=success_wrist_ang_vel,
             target_done=target_done,
+            target_velocity=target_velocity,
+            success_elbow_apex=success_elbow_apex,
+            target_T=target_T,
         )
 
         # 팔별 역할 저장 (다음 스텝 관측에 사용 — 보행 위상클럭 격)
@@ -332,8 +371,9 @@ class DrumRobotEnv(DirectRLEnv):
         # 드럼 위치 리셋 (perturbation)
         self._reset_drum(env_ids)
 
-        # RDS 리셋
-        self.rds.reset(env_ids=env_ids, score_ratio=0.0, selection_strength=0.0)  # 랜덤으로 RDS 생성해서 사용
+        # RDS 리셋 — MIDI 커리큘럼: 초반 랜덤 위주(기본 타격 습득) → 후반 실제 MIDI 비중 램프인
+        score_ratio = self._midi_curriculum_ratio()
+        self.rds.reset(env_ids=env_ids, score_ratio=score_ratio, selection_strength=self.cfg.midi_selection_strength)
 
         # 로봇 자세 리셋
         init_robot_pos = self.robot_initializer.reset_init_pos(env_ids)
@@ -343,7 +383,12 @@ class DrumRobotEnv(DirectRLEnv):
         # tip 리셋
         tip_pos = self.robot_interface.get_body_pos(self.robot)
         self.hit_detector.reset(env_ids=env_ids, tip_pos=tip_pos)
- 
+
+        # 팔꿈치 baseline 리셋: 직전 타격 없음 → 현재 팔꿈치각으로 (리프트 0에서 시작), apex 0
+        elbow_angle = self.robot_interface.get_joint_pos(self.robot)[:, self.elbow_joint_ids]
+        self.elbow_baseline[env_ids] = elbow_angle[env_ids]
+        self.elbow_apex_buf[env_ids] = 0.0
+
         # 텐서 변수들 리셋
         self._reset_tensors(env_ids)
 
@@ -355,6 +400,19 @@ class DrumRobotEnv(DirectRLEnv):
     # Internal utility methods (NOT called by RL engine directly)
     # ============================================================
 
+    def _midi_curriculum_ratio(self) -> float:
+        # 평가: MIDI 비율 고정 (커리큘럼 무시)
+        if self.cfg.eval_midi_ratio >= 0.0:
+            return self.cfg.eval_midi_ratio
+
+        # 성공률(EMA) 기반: start 전엔 순수 랜덤 → start~full 선형 증가 → final 고정.
+        # reward_computer가 유지하는 전체 성공률 EMA 사용. MIDI가 성공률 끌어내리면 비율도 자동 감소(자기조절).
+        ema = self.reward_computer.success_ema
+        start = self.cfg.midi_success_start
+        frac = (ema - start) / max(1e-6, self.cfg.midi_success_full - start)
+        frac = min(max(frac, 0.0), 1.0)
+        return self.cfg.midi_final_ratio * frac
+
     """ init """
     def _init_obs(self):
         # obs 차원 계산
@@ -365,7 +423,7 @@ class DrumRobotEnv(DirectRLEnv):
         self.obs_dim_joint_vel = 9
         self.obs_dim_tip       = 2 * 3                 # 양손 * xyz
         self.obs_dim_drum      = M * 3                 # 드럼 * xyz
-        self.obs_dim_next      = K * (M + 2)           # lookahead K개 * (one-hot M + time + valid)
+        self.obs_dim_next      = K * (M + 3)           # lookahead K개 * (one-hot M + time + valid + 목표세기 u)
         self.obs_dim_armed     = 2 * M                 # 양손 * 드럼
         self.obs_dim_role      = 2                     # 팔별 역할 (활성=1/노는팔=0) — 보행 위상클럭 격
 
@@ -412,7 +470,7 @@ class DrumRobotEnv(DirectRLEnv):
         # joint_pos, joint_vel: (N, 9)
         # tip_pos: (N, 2, 3)
         # drum_pos: (N, M, 3)
-        # next_hits: (N, K, M+2)
+        # next_hits: (N, K, M+3)  (targets M + time + valid + 목표세기 u)
         # hit_armed: (N, 2, M)
         # arm_role: (N, 2)  활성=1/노는팔=0
 

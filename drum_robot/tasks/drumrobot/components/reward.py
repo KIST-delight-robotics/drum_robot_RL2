@@ -508,6 +508,8 @@ def compute_rewards(
         w_impact_vel: float,
         wrist_snap_reward: torch.Tensor,
         w_wrist_snap: float,
+        intensity_reward: torch.Tensor,
+        w_intensity: float,
         off_target_pen: torch.Tensor,
         w_off_target: float,
         crowd_pen: torch.Tensor,
@@ -531,6 +533,7 @@ def compute_rewards(
 
         + w_impact_vel * impact_vel_reward
         + w_wrist_snap * wrist_snap_reward
+        + w_intensity * intensity_reward
 
         - w_action * action_l2
         - w_joint_vel * joint_vel_l2
@@ -557,7 +560,7 @@ class RewardComputerCfg:
     w_free_arm: float = 0.5 # 노는 팔을 다음 타격(h1)으로 유도하는 이동 가중치
 
     # 노는 팔 ready-pose (다음 드럼 위 준비높이 hover → 수직 헛스윙 억제). 역할 관측과 함께 작동
-    w_ready: float = 0.3         # ready-pose 보상 가중치
+    w_ready: float = 0.3         # ready-pose 보상 가중치 (1.5로 올렸더니 로봇이 안 치고 hover만 하는 reward-hacking → 0.3 원복)
     ready_height: float = 0.18   # 드럼 위 준비 높이 [m] (off_target 밴드 0.12보다 위)
     k_ready: float = 10.0        # ready-pose 보상 감쇠 (3D 제곱거리 기준)
 
@@ -583,7 +586,7 @@ class RewardComputerCfg:
     w_success: float = 5.0
     w_wrong: float = 3.0 #1.5
     w_miss: float = 2.0
-    w_time_accuracy: float = 5.0
+    w_time_accuracy: float = 3.0
 
     w_progress: float = 4.0
     w_proximity: float = 1.5
@@ -591,12 +594,34 @@ class RewardComputerCfg:
     w_upward: float = 0 #0.4
     w_downward: float = 0 #0.5
 
+    # === phase-1 "결정적 타격" 보상 (w_upward/downward=0이라 이게 유일한 "빠르게 내리쳐라" 신호) ===
+    # 세기 매칭이 켜지면 크로스페이드로 페이드아웃 (무조건 "세게" → "목표만큼"). 검증된 베이스 유지가 목적.
     w_impact_vel: float = 3.0
     impact_vel_max: float = 1.0
-
-    # 손목 스냅 보상 (성공 타격 시 손목 각속도 rad/s에 비례). 팔 대신 손목 사용 유도
     w_wrist_snap: float = 3.0
     wrist_snap_max: float = 12.0   # 정규화 기준 (실측 느긋 7~13 rad/s의 중간)
+
+    # === 세기(dynamics): MIDI velocity → 복합 목표(충격속도+손목ω), 목표-상대 exp 매칭 ===
+    # [[intensity-teaching-design]]. velocity(0~127) u=vel/127 → 물리 목표 선형 매핑.
+    vel_imp_min: float = 0.3      # velocity 0 → 목표 팁 충격속도 [m/s] (검출임계 0.2 위 floor)
+    vel_imp_max: float = 1.5      # velocity 127 → 목표 팁 충격속도 [m/s]
+    vel_wrist_min: float = 3.0    # velocity 0 → 목표 손목 각속도 [rad/s]
+    vel_wrist_max: float = 15.0   # velocity 127 → 목표 손목 각속도 [rad/s]
+    # 팔꿈치 리프트 apex 목표 — 자연스러운 "들었다 내리치기" 형태 강제 (옛 검증값 p=0/f≈0.3rad)
+    vel_elbow_min: float = 0.15   # velocity 0 → 목표 리프트 [rad] (여림=작은 스트로크, 자연 최소치 ~0.16 반영)
+    vel_elbow_max: float = 0.40   # velocity 127 → 목표 리프트 [rad] (셈=큰 windup)
+    k_imp_match: float = 0.5      # 충격속도 오차² exp 계수 (오차 ~1.8 m/s → exp(-1)). 낮춰서 멀리서도 기울기 유지(목표 못 낮추므로)
+    k_wrist_match: float = 0.05   # 손목ω 오차² exp 계수 (오차 ~4.5 rad/s → exp(-1)). ↑=타협점(중간ω) 벌줘 세기 차등 강제
+    k_elbow_match: float = 30.0   # 팔꿈치 리프트 오차² exp 계수 (오차 ~0.18 rad → exp(-1))
+    w_imp_match: float = 1.0      # (미사용) 충격속도 매칭 — 손목ω와 중복이라 intensity_reward에서 제외됨
+    w_wrist_match: float = 5.0    # 복합 내부 배율: 손목ω(세기 주력·손목화 레버) 매칭 — 세기 유인 강화
+    w_elbow_match: float = 2.0    # 복합 내부 배율: 팔꿈치 리프트(형태·windup) 매칭 — 세기 유인 강화
+    # 세기 매칭 보상 게이팅 (경험칙: 처음부터 세기 가르치면 학습 난항 → 타격 성공률 먼저 올린 뒤 켬)
+    # power/waist 게이팅과 별개 램프 — 세기는 더 늦게(성공률 0.7부터) 시작
+    w_intensity_max: float = 5.0            # 세기 매칭 보상 최대치 (기존 무조건 impact/snap=3 수준)
+    # stagger: MIDI(0.65~)가 먼저 조금 들어온 뒤 세기 시작. 성공률 0.8 부근 정체라 0.7부터 켜야 실제로 작동. [[midi-mixing-and-density]]
+    w_intensity_success_start: float = 0.7   # 이 성공률(EMA)부터 세기 학습 켜기 시작
+    w_intensity_success_full: float = 0.80   # 이 성공률에서 최대치 = 세게치기 완전 페이드아웃 (좁게 → 확실히 핸드오버)
 
     w_action: float = 0.0003
     w_wrist_action_scale: float = 0.001  # 손목 action 페널티 배율 (손목 스냅 위해 완화)
@@ -617,6 +642,11 @@ class RewardComputerCfg:
     w_under_drum: float = 0.1 #0.08
     w_self_collision: float = 0.5
     self_collision_threshold: float = 0.10  # 스틱 간 거리 임계값 [m]
+
+    # 팔꿈치 최소 굽힘: 팔을 쫙 펴고(0°) 치는 부자연스러운 자세 방지. 항상 이 각도 이상 굽히도록 유도.
+    # robot_pos 팔꿈치각 [0°=편, 140°=굽힘]. 이 값 미만이면 (편 정도만큼) 벌점.
+    elbow_min_bend: float = 0.35        # 최소 굽힘 [rad] ≈ 20°
+    w_elbow_bend: float = 1.5           # 최소굽힘 위반 페널티 가중
 
     # 악기별 가중치 업데이트 주기 (step)
     update_interval: int = 100
@@ -661,6 +691,12 @@ class RewardComputer:
             device=self.device, dtype=torch.long,
         )
 
+        # 팔꿈치 각속도 인덱스 [왼,오] (진단 로그용 — 세기↑ 때 팔꿈치가 실제로 스윙에 참여하는지 관찰). 목표 아님
+        self.elbow_ids = torch.tensor(
+            [name_to_idx["left_elbow"], name_to_idx["right_elbow"]],
+            device=self.device, dtype=torch.long,
+        )
+
         # 허리/어깨 각속도 인덱스 (진단 로그용 — 무거운 관절 움직임 모니터)
         self.waist_ids = torch.tensor(
             [i for i, n in enumerate(ctrl_joint_names) if "waist" in n],
@@ -671,9 +707,14 @@ class RewardComputer:
             device=self.device, dtype=torch.long,
         )
 
-        # 일률/허리 페널티 성공률 게이팅 상태 (초기엔 꺼짐 → 성공률 오르면 램프인)
+        # 일률/허리 페널티 + 세기 매칭 성공률 게이팅 상태 (초기엔 꺼짐 → 성공률 오르면 램프인)
+        # 세기는 "타이밍/타격을 먼저 익힌 뒤" 켜야 붕괴 안 함 → power와 동일 램프 재사용 [[intensity-teaching-design]]
         self.w_power_eff = 0.0
         self.w_waist_eff = 0.0
+        self.w_intensity_eff = 0.0
+        # phase-1 결정적 타격 보상: 초기엔 full(검증된 베이스와 동일), 세기 매칭 켜지며 페이드아웃
+        self.w_impact_vel_eff = self.cfg.w_impact_vel
+        self.w_wrist_snap_eff = self.cfg.w_wrist_snap
         self.success_ema = 0.0
 
         # 악기별 보상 가중치
@@ -708,6 +749,9 @@ class RewardComputer:
             success_impact_vel: torch.Tensor,  # (N, M) 성공한 타격의 하강 속도
             success_wrist_ang_vel: torch.Tensor,  # (N, M) 성공한 타격의 손목 각속도
             target_done: torch.Tensor,  # (N, M) 유효 타격 완료된 타겟 (재타 downward 억제)
+            target_velocity: torch.Tensor,  # (N, M) 마감 타겟의 목표 MIDI velocity(0~127) → 세기 매칭
+            success_elbow_apex: torch.Tensor,  # (N, M) 성공 타격의 팔꿈치 리프트 apex [rad]
+            target_T: torch.Tensor,  # (N, M) 마감 타겟의 간격 T[s] → 손목/팔꿈치 목표 T-종속 계산
     ) -> tuple[torch.Tensor, dict, dict, torch.Tensor]:  # reward, log, rate_log, active_arm(N,2)
         # goal
         success_reward, wrong_cost, missed_cost, time_accuracy_reward = _goal_terms(
@@ -783,15 +827,44 @@ class RewardComputer:
             threshold=self.cfg.self_collision_threshold,
         )
 
-        # impact velocity: 성공한 타격의 속도에만 보상 (타겟당 1회). 연타 유인 제거
+        # phase-1 결정적 타격 보상 (성공 타격에 대해 하강속도/손목ω 자체에 보상). 세기 매칭 켜지면 페이드아웃.
         impact_vel_reward = (success_impact_vel / (self.cfg.impact_vel_max + 1e-8)).sum(dim=1)  # (N,)
-
-        # wrist snap: 성공한 타격의 손목 각속도에 보상 (타겟당 1회). 팔 대신 손목 사용 유도
         wrist_snap_reward = (success_wrist_ang_vel / (self.cfg.wrist_snap_max + 1e-8)).sum(dim=1)  # (N,)
+
+        # 세기(dynamics) 매칭 — C++ 실기 T-종속 공식: 목표 = 세기(i)·간격(T)의 함수. [[t-dependent-intensity-targets]]
+        # 손목ω가 주력(임팩트), 팔꿈치 리프트는 형태(윈드업, threshold i>3). impact 매칭은 손목과 중복이라 제거.
+        d2r = 3.141592653589793 / 180.0
+        u = target_velocity / 127.0                                          # (N, M) 0~1
+        i = 1.0 + 6.0 * u                                                    # MIDI velocity → 실기 intensity 1~7
+        T = target_T.clamp(0.1, 1.0)                                         # (N, M) 간격[s]
+
+        # 손목 ω = 2·L(T)·f_w(i) / T_hit  (stay baseline 제외, 세기 추가분만). velocity_limit 30 상한.
+        f_w = torch.where(i < 5.0, 0.25 * i - 0.25, i / 3.0 - 2.0 / 3.0)
+        L   = torch.where(T < 0.5, (40.0 * T + 10.0) * d2r, torch.full_like(T, 30.0 * d2r))
+        T_hit = (0.3 * T).clamp(max=0.2)
+        w_wrist_tgt = (2.0 * L * f_w / T_hit).clamp(min=0.0, max=30.0)       # (N, M) rad/s
+
+        # 팔꿈치 리프트 apex = lift_mag(T)·f_e(i)  (threshold: i≤3 → 0, 즉 여림은 팔 안 듦)
+        f_e = torch.where(i <= 3.0, torch.zeros_like(i), 0.1 * i + 0.5)
+        lift_mag = torch.where(T < 0.2, torch.zeros_like(T),
+                     torch.where(T <= 0.5, T * (15.0 * d2r) / 0.5, torch.full_like(T, 15.0 * d2r)))
+        elbow_tgt = lift_mag * f_e                                           # (N, M) rad
+
+        err_wrist = success_wrist_ang_vel - w_wrist_tgt
+        err_elbow = success_elbow_apex    - elbow_tgt
+        r_wrist = torch.exp(-self.cfg.k_wrist_match * err_wrist * err_wrist)  # (N, M) 1=정확
+        r_elbow = torch.exp(-self.cfg.k_elbow_match * err_elbow * err_elbow)
+        intensity_reward = (success.float() * (
+            self.cfg.w_wrist_match * r_wrist + self.cfg.w_elbow_match * r_elbow
+        )).sum(dim=1)  # (N,)
 
         # 전용 허리 속도 페널티: 몸통 고정 유도. 성공률 게이팅(w_waist_eff)이라 초기 리치 학습 방해 없음
         waist_vel = robot_vel[:, self.waist_ids]                          # (N, n_waist)
         waist_vel_pen = torch.sum(waist_vel * waist_vel, dim=-1)          # (N,)
+
+        # 팔꿈치 최소 굽힘 페널티: 팔 펴고(각도 0 근처) 치는 부자연스러움 방지. min_bend 미만이면 부족분 벌점 (양팔 합)
+        elbow_angle_now = robot_pos[:, self.elbow_ids]                    # (N, 2) [0=편, 140°=굽힘]
+        elbow_bend_pen = torch.clamp(self.cfg.elbow_min_bend - elbow_angle_now, min=0.0).sum(dim=-1)  # (N,)
 
         reward = compute_rewards(
             success_reward=success_reward,
@@ -832,9 +905,11 @@ class RewardComputer:
             w_self_collision=self.cfg.w_self_collision,
             self_col_pen=self_col_pen,
             impact_vel_reward=impact_vel_reward,
-            w_impact_vel=self.cfg.w_impact_vel,
+            w_impact_vel=self.w_impact_vel_eff,
             wrist_snap_reward=wrist_snap_reward,
-            w_wrist_snap=self.cfg.w_wrist_snap,
+            w_wrist_snap=self.w_wrist_snap_eff,
+            intensity_reward=intensity_reward,
+            w_intensity=self.w_intensity_eff,
             off_target_pen=off_target_pen,
             w_off_target=self.cfg.w_off_target,
             crowd_pen=crowd_pen,
@@ -844,6 +919,9 @@ class RewardComputer:
             ready_pose_reward=ready_pose_reward,
             w_ready=self.cfg.w_ready,
         )
+
+        # 팔꿈치 최소 굽힘 페널티 (jit 밖에서 적용 — 시그니처 불변). 팔 펴고 치는 자세 억제
+        reward = reward - self.cfg.w_elbow_bend * elbow_bend_pen
 
         num_hit_drum = success.float() + missed_target.float()
 
@@ -864,7 +942,10 @@ class RewardComputer:
             "w_power_eff(x1000)": torch.full_like(reward, self.w_power_eff * 1000.0),
             "waist_ang_vel": robot_vel[:, self.waist_ids].abs().mean(dim=-1),
             "shoulder_ang_vel": robot_vel[:, self.shoulder_ids].abs().mean(dim=-1),
+            "elbow_ang_vel": robot_vel[:, self.elbow_ids].abs().mean(dim=-1),
             "waist_vel_pen": waist_vel_pen,
+            "elbow_bend_pen": elbow_bend_pen,
+            "elbow_angle_min": robot_pos[:, self.elbow_ids].min(dim=-1).values,  # 양팔 중 더 편 팔꿈치각(진단)
             "w_waist_eff(x100)": torch.full_like(reward, self.w_waist_eff * 100.0),
             "ready_pose": ready_pose_reward,
             "limit_pen(x100)": limit_pen * 100,
@@ -876,6 +957,8 @@ class RewardComputer:
             "forearm_dist": forearm_dist,
             "impact_vel": impact_vel_reward,
             "wrist_snap": wrist_snap_reward,
+            "intensity_reward": intensity_reward,
+            "w_intensity_eff": torch.full_like(reward, self.w_intensity_eff),
         }
 
         # 실제 타격 순간만 뽑아 평균 (hit이 난 팔만)
@@ -890,6 +973,10 @@ class RewardComputer:
         wrist_vel_abs = robot_vel[:, self.wrist_ids].abs()                # (N, 2)
         wrist_vel_sum = (hit_any_per_arm.float() * wrist_vel_abs).sum(dim=1)  # (N,)
 
+        # 타격 순간 팔꿈치 각속도 (rad/s) — 세기↑ 때 팔꿈치 스윙 참여도 관찰 (진단, 목표 아님)
+        elbow_vel_abs = robot_vel[:, self.elbow_ids].abs()                # (N, 2)
+        elbow_vel_sum = (hit_any_per_arm.float() * elbow_vel_abs).sum(dim=1)  # (N,)
+
         # 드럼별 타격 속도 (m/s): 팔의 하강 속도를 그 팔이 친 드럼에 배분
         vel_per_drum = (hit_per_arm.float() * down_vel_ms[:, :, None]).sum(dim=1)  # (N, M)
         hit_per_drum = hit_per_arm.float().sum(dim=1)                             # (N, M)
@@ -900,6 +987,7 @@ class RewardComputer:
             "miss_rate": torch.stack([num_missed, num_hit], dim=-1),
             "avg_impact_vel_ms": torch.stack([vel_sum, hit_arm_count], dim=-1),
             "hit_wrist_ang_vel": torch.stack([wrist_vel_sum, hit_arm_count], dim=-1),
+            "hit_elbow_ang_vel": torch.stack([elbow_vel_sum, hit_arm_count], dim=-1),
         }
 
         for i, name in enumerate(self.drum_names):
@@ -907,6 +995,18 @@ class RewardComputer:
             rate_log_terms[f"{name}_wrong_rate"]   = torch.stack([wrong_hit[:, i], num_hit_drum[:, i]], dim=-1)
             rate_log_terms[f"{name}_miss_rate"]    = torch.stack([missed_target[:, i], num_hit_drum[:, i]], dim=-1)
             rate_log_terms[f"{name}_impact_vel"]   = torch.stack([vel_per_drum[:, i], hit_per_drum[:, i]], dim=-1)
+
+        # 세기(dynamics) 진단: 성공 타격을 목표 velocity 구간(p≤48 / mf≤90 / f>90, 실측 terciles)으로 나눠
+        #   달성 충격속도·손목ω 기록 → soft<mid<loud로 분리되면 다이내믹 학습된 것. + 목표 매칭 정확도(0~1).
+        succ_f = success.float()
+        match = 0.5 * (r_wrist + r_elbow)                                      # (N, M) 1=목표 정확 매칭 (손목ω + 팔꿈치 리프트)
+        rate_log_terms["intensity_match"] = torch.stack([(match * succ_f).sum(dim=-1), succ_f.sum(dim=-1)], dim=-1)
+        for lo, hi, tag in ((0.5, 48.5, "p"), (48.5, 90.5, "mf"), (90.5, 1e9, "f")):
+            bm = (succ_f * ((target_velocity > lo) & (target_velocity <= hi)).float())  # (N, M) 그 세기구간 성공
+            cnt = bm.sum(dim=-1)
+            rate_log_terms[f"dyn_impact_{tag}"] = torch.stack([(success_impact_vel * bm).sum(dim=-1), cnt], dim=-1)
+            rate_log_terms[f"dyn_wrist_{tag}"]  = torch.stack([(success_wrist_ang_vel * bm).sum(dim=-1), cnt], dim=-1)
+            rate_log_terms[f"dyn_elbow_{tag}"]  = torch.stack([(success_elbow_apex * bm).sum(dim=-1), cnt], dim=-1)
 
         return reward, log_terms, rate_log_terms, active_arm
     
@@ -944,6 +1044,15 @@ class RewardComputer:
             ramp = min(max(ramp, 0.0), 1.0)
             self.w_power_eff = self.cfg.w_power_max * ramp
             self.w_waist_eff = self.cfg.w_waist_max * ramp   # 전용 허리 페널티도 동일 게이팅
+
+            # 세기 매칭은 별도 램프 — 성공률 0.7부터 시작 (타격 먼저 익힌 뒤 세기). [[intensity-teaching-design]]
+            denom_i = max(self.cfg.w_intensity_success_full - self.cfg.w_intensity_success_start, 1e-6)
+            ramp_i = (self.success_ema - self.cfg.w_intensity_success_start) / denom_i
+            ramp_i = min(max(ramp_i, 0.0), 1.0)
+            self.w_intensity_eff = self.cfg.w_intensity_max * ramp_i
+            # 크로스페이드: 세기 매칭 켜지는 만큼 무조건 "세게" 페이드아웃 (phase-1 결정적 타격 → 목표 매칭)
+            self.w_impact_vel_eff = self.cfg.w_impact_vel * (1.0 - ramp_i)
+            self.w_wrist_snap_eff = self.cfg.w_wrist_snap * (1.0 - ramp_i)
 
             # 통계 초기화
             self.n_success.zero_()

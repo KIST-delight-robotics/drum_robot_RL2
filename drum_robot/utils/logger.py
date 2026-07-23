@@ -106,7 +106,8 @@ class EnvLogger:
             p_sum = self._p_sum[k]  # (N,2)
             num = p_sum[:,0].sum() / denom
             den = p_sum[:,1].sum() / denom
-            p_parts.append(f"{k}={num/(den+1e-6):.3f}")
+            n_total = p_sum[:,1].sum()   # 이 지표가 평균낸 총 표본 수(분모 누적, window 전체·전 env 합)
+            p_parts.append(f"{k}={num/(den+1e-6):.3f}(n{n_total.item():.0f})")
 
         head = f"\n[STEP {self.step}]"
         if prefix:

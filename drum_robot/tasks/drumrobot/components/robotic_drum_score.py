@@ -101,6 +101,10 @@ class RDSCfg:
     max_lookahead_s: float = 1.0    # 최대 관측 범위 (초)
     num_hits: int = 3               # 최대 관측 타격 개수
 
+    # 평가(play1.py)용 — 기본값이면 학습과 동일 동작 (무영향)
+    eval_midi_file: str = ""        # 지정 시 이 MIDI 파일 하나만 로드 (레벨2/3)
+    eval_full_song: bool = False    # True면 파일 전체를 1개 긴 악보로 빌드 (마디 조각 아님, 레벨3)
+
 class RDS:
     def __init__(
             self,
@@ -136,10 +140,12 @@ class RDS:
         T = env.episode_length_step
         M = self.num_drums
 
-        self.rds = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
+        self.rds = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)   # 값 = MIDI velocity(0=없음, 1~127=세기). 모든 >0 체크는 타격 유무 [[intensity-teaching-design]]
         self.rds_visit = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)
         self.rds_visit_vel = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)   # 타격 순간 하강 속도 기록
         self.rds_visit_wrist = torch.zeros((N, T, M), device=self.device, dtype=torch.float32) # 타격 순간 손목 각속도 기록
+        self.rds_visit_elbow_apex = torch.zeros((N, T, M), device=self.device, dtype=torch.float32) # 타격 순간 팔꿈치 리프트 apex 기록
+        self.rds_T = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)   # 각 타격의 직전 타격까지 간격[s] (손목/팔꿈치 목표 T-종속) [[t-dependent-intensity-targets]]
 
         # util
         self.env_arange = torch.arange(self.env.num_envs, device=self.device)
@@ -153,10 +159,11 @@ class RDS:
             step: (N,)       # 현재 step
 
         Returns:
-            next_hits_obs: (N, K, M + 2)
-                [:, :, :M]     = target drum multi-hot
+            next_hits_obs: (N, K, M + 3)
+                [:, :, :M]     = target drum multi-hot (이진: 어느 드럼)
                 [:, :, M]      = normalized time_to_hit, 0.0 ~ 1.0
                 [:, :, M + 1]  = valid flag, 1이면 유효 이벤트, 0이면 없음
+                [:, :, M + 2]  = normalized 목표 세기 u = MIDI velocity / 127 (0~1). "얼마나 세게" [[intensity-teaching-design]]
         """
         N, T, M = self.rds.shape
         L = self.env.max_lookahead_step
@@ -192,13 +199,20 @@ class RDS:
         next_targets = torch.zeros((N, K, M), device=self.device, dtype=torch.float32)
         next_times = torch.ones((N, K, 1), device=self.device, dtype=torch.float32)
         next_valid = torch.zeros((N, K, 1), device=self.device, dtype=torch.float32)
+        next_intensity = torch.zeros((N, K, 1), device=self.device, dtype=torch.float32)   # 정규화 목표 세기 u
 
         if selected.any():
             env_idx, time_idx = torch.where(selected)      # 선택된 event 위치  # (num_selected,)
             hit_idx = event_order[env_idx, time_idx]       # 몇 번째 hit인지, 0 ~ K-1
 
-            # target multi-hot
-            next_targets[env_idx, hit_idx] = future_rds[env_idx, time_idx].to(torch.float32)
+            fut = future_rds[env_idx, time_idx]            # (num_sel, M) 값 = MIDI velocity(1~127)
+
+            # target multi-hot (이진화: 어느 드럼. 세기는 별도 채널)
+            next_targets[env_idx, hit_idx] = (fut > 0).to(torch.float32)
+
+            # 목표 세기 u = 그 타격 velocity / 127 (동시 2타면 max — 순차 세기는 정확)
+            vel = fut.amax(dim=-1).to(torch.float32)       # (num_sel,)
+            next_intensity[env_idx, hit_idx, 0] = vel / 127.0
 
             # normalized time_to_hit
             # offset 0이면 지금, offset L이면 horizon 끝
@@ -209,16 +223,17 @@ class RDS:
             next_valid[env_idx, hit_idx, 0] = 1.0
 
         next_hits = torch.cat(
-            [next_targets, next_times, next_valid],
+            [next_targets, next_times, next_valid, next_intensity],
             dim=-1
-        )   # (N, K, M+2)
+        )   # (N, K, M+3)
 
         return next_hits
     
-    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor, hit_wrist: torch.Tensor):
+    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor, hit_wrist: torch.Tensor, hit_elbow_apex: torch.Tensor):
         self.rds_visit[self.env_arange, steps, :] = hit_mask         # 타격한 시간에 방문 처리
         self.rds_visit_vel[self.env_arange, steps, :] = hit_vel      # 그 시간의 타격 속도 기록
         self.rds_visit_wrist[self.env_arange, steps, :] = hit_wrist  # 그 시간의 손목 각속도 기록
+        self.rds_visit_elbow_apex[self.env_arange, steps, :] = hit_elbow_apex  # 그 시간의 팔꿈치 리프트 apex 기록
 
     def get_rds(self) -> torch.Tensor:
         return self.rds
@@ -231,6 +246,12 @@ class RDS:
 
     def get_rds_visit_wrist(self) -> torch.Tensor:
         return self.rds_visit_wrist
+
+    def get_rds_visit_elbow_apex(self) -> torch.Tensor:
+        return self.rds_visit_elbow_apex
+
+    def get_rds_T(self) -> torch.Tensor:
+        return self.rds_T
 
     def reset(self, env_ids: torch.Tensor, score_ratio: float=0.5, selection_strength: float=0.5):
         N = len(env_ids)
@@ -258,13 +279,36 @@ class RDS:
 
         # reset
         robotic_drum_score = torch.cat(outputs, dim=0)
+
+        # 각 타격의 T(직전 타격까지 간격, 초) 계산 — 손목/팔꿈치 목표를 T-종속(C++공식)으로. [[t-dependent-intensity-targets]]
+        n, Tn, M = robotic_drum_score.shape
+        hit_cell = (robotic_drum_score > 0)                                       # (n,T,M)
+        hit_t = hit_cell.any(dim=2)                                               # (n,T) 타격 있는 시각(드럼 무관)
+        tar = torch.arange(Tn, device=self.device)
+        htime = torch.where(hit_t, tar.unsqueeze(0), torch.full((n, Tn), -1, device=self.device, dtype=torch.long))
+        cummax_h, _ = torch.cummax(htime, dim=1)                                  # t까지 최근 타격시각
+        prev = torch.full_like(cummax_h, -1)
+        prev[:, 1:] = cummax_h[:, :-1]                                            # t 직전(엄격히 이전) 타격시각
+        gap_steps = (tar.unsqueeze(0) - prev).float()                            # 직전까지 스텝
+        T_sec = (gap_steps * self.env.step_dt).clamp(0.1, 1.0)                    # 초, 극단 clamp
+        self.rds_T[env_ids] = T_sec.unsqueeze(2) * hit_cell.float()              # 타격 셀에만 T
+
         self.rds[env_ids] = robotic_drum_score
         self.rds_visit[env_ids] = False
         self.rds_visit_vel[env_ids] = 0.0
         self.rds_visit_wrist[env_ids] = 0.0
+        self.rds_visit_elbow_apex[env_ids] = 0.0
 
     # ===== INIT =====
     def _glob_midi_files(self) -> list:
+        # 평가: 특정 파일 하나만 (레벨2/3)
+        if self.cfg.eval_midi_file:
+            p = Path(self.cfg.eval_midi_file)
+            if not p.exists():
+                raise ValueError(f"eval MIDI 파일 없음: {p}")
+            print(f"[RDS] eval 전용 단일 MIDI: {p.name}")
+            return [p]
+
         folder = Path(self.cfg.midi_folder_path)
         midi_files = list(folder.glob("*.mid"))
 
@@ -272,8 +316,48 @@ class RDS:
             raise ValueError("MIDI 파일이 없습니다!")
 
         return midi_files
-    
+
+    def _build_full_song(self, midi_files: list) -> torch.Tensor:
+        """레벨3 평가용: 파일 전체를 1개 긴 악보로. 마디 경계 무시, 모든 노트를 시간축에 배치.
+        연주가능성 min_gap 드롭 동일 적용. episode_length_step(T) 초과분은 잘림(play1.py가 T를 충분히 크게 설정)."""
+        T = self.env.episode_length_step
+        M = self.num_drums
+        bpm, events = self._read_midi_file(midi_files[0])
+
+        rds = torch.zeros((T, M), device=self.device, dtype=torch.int64)
+        min_gap = 2 * self.env.hit_window_step + 1
+        last_idx = [-(10 ** 9)] * M
+        safe_T = T - self.env.hit_window_step
+
+        first = True
+        first_t = 0.0
+        placed = 0
+        for t, note, vel in events:
+            if first:
+                first_t = t
+                first = False
+            if note not in self.cfg.note_to_drum_idx:
+                continue
+            drum_idx = self.cfg.note_to_drum_idx[note]
+            time_idx = int(round(self.cfg.slow_factor * (t - first_t) / self.env.step_dt)) + self.cfg.start_offset_steps
+            if time_idx >= safe_T:
+                break   # 곡이 에피소드보다 김 → 잘림
+            if time_idx - last_idx[drum_idx] < min_gap:
+                continue
+            rds[time_idx, drum_idx] = int(vel)
+            last_idx[drum_idx] = time_idx
+            placed += 1
+
+        if placed == 0:
+            raise RuntimeError("full-song: 배치된 노트가 없음")
+        print(f"[RDS] full-song: {midi_files[0].name} → {placed} notes / {safe_T} steps")
+        return rds.unsqueeze(0).to(self.device)   # (1, T, M)
+
     def _build_rds_dataset(self, midi_files: list) -> torch.Tensor:
+        # 레벨3: 곡 전체를 1개 긴 악보로
+        if self.cfg.eval_full_song:
+            return self._build_full_song(midi_files)
+
         rds_list = []
 
         for file_path in midi_files:
@@ -332,7 +416,7 @@ class RDS:
 
                     time_sec = (current_time * tempo) / (ticks_per_beat * 1_000_000)
 
-                    events.append((time_sec, instrument))
+                    events.append((time_sec, instrument, msg.velocity))   # velocity(1~127) 보존 → 세기 학습
 
         events.sort()   # 멀티 트랙인 경우 시간 순으로 정렬
 
@@ -341,7 +425,7 @@ class RDS:
     def _generate_rds_from_midi(
             self,
             bpm: float,
-            events: list[tuple[float, str]],
+            events: list[tuple[float, str, int]],
             prev_t: float,
     ) -> tuple[torch.Tensor, float, bool]:
         T = self.env.episode_length_step
@@ -356,7 +440,13 @@ class RDS:
         end = True
         next_t = 0.0
 
-        for t, note in events:
+        # 연주 가능성 가드: 같은 드럼 최소 간격 (랜덤 브랜치와 동일 min_gap=2W+1).
+        # 실제 MIDI는 빠른 하이햇/플램/고스트노트가 min_gap 미만으로 붙어 있어 (a) 재장전(0.18m 리프트) 불가,
+        # (b) 드럼별 hit 윈도우(±W) 겹쳐 채점 꼬임 → 못 치고 채점도 안 되는 조밀 클러스터를 드롭. [[midi-mixing-and-density]]
+        min_gap = 2 * self.env.hit_window_step + 1
+        last_idx = [-(10 ** 9)] * M   # 드럼별 마지막 배치 time_idx (events는 시간순 → 클러스터 첫 노트 유지, 이후 드롭)
+
+        for t, note, vel in events:
             if t < prev_t:
                 continue
 
@@ -382,13 +472,19 @@ class RDS:
             if time_idx >= safe_T:
                 continue  # episode 길이 초과 이벤트는 무시
 
-            # 모든 env에 이벤트 적용
-            robotic_drum_score[time_idx, drum_idx] = 1
+            # 같은 드럼에서 직전 배치와 min_gap 미만이면 드롭 (재장전 불가·윈도우 겹침 방지)
+            if time_idx - last_idx[drum_idx] < min_gap:
+                continue
+
+            # 모든 env에 이벤트 적용 (값 = MIDI velocity → 세기)
+            robotic_drum_score[time_idx, drum_idx] = int(vel)
+            last_idx[drum_idx] = time_idx
 
         return robotic_drum_score, next_t, end
 
     def _compute_score(self, rds_tensors: torch.Tensor) -> torch.Tensor:
-        # rds_tensors: (N, T, M), 0/1
+        # rds_tensors: (N, T, M), 값=velocity → 샘플링 가중치는 세기 무관하게 타격 유무 기준. 이진화.
+        rds_tensors = (rds_tensors > 0).to(rds_tensors.dtype)
         N, T, M = rds_tensors.shape
 
         # 1. 사용된 드럼 개수
@@ -500,5 +596,9 @@ class RDS:
                 pair = self.double_pairs[pair_idx]   # (N, 2)
                 rds_rand[env[double_mask], ti[double_mask], pair[double_mask, 0]] = 1
                 rds_rand[env[double_mask], ti[double_mask], pair[double_mask, 1]] = 1
+
+        # 세기: 타격 셀마다 독립 랜덤 velocity(1~127). MIDI가 못 채우는 세기 구간까지 균형 커버 [[intensity-teaching-design]]
+        vel = torch.randint(1, 128, rds_rand.shape, device=device)
+        rds_rand = torch.where(rds_rand > 0, vel, torch.zeros_like(rds_rand))
 
         return rds_rand

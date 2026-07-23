@@ -25,8 +25,22 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     decimation: int = 2             # 정책(Policy) 업데이트 한 번당 시뮬레이션 스텝 수
     episode_length_s: float = 5.0   # 에피소드 최대 길이 (초)
     action_space: int = 9           # 로봇 제어 차원
-    observation_space: int = 96     # 관측 차원 (+2: 팔별 역할 active/idle)
+    observation_space: int = 99     # 관측 차원 (+3: lookahead K(3) * 목표세기 u 1채널)
     state_space: int = 0
+
+    # MIDI 커리큘럼: 성공률(EMA) 기반 점진 램프 — 기본 타격 익힌 뒤 실제 MIDI(연주가능하게 가공됨) 투입
+    # [[midi-mixing-and-density]]. 세기 게이팅(0.8~)보다 먼저 시작하도록 stagger (동시투하 방지).
+    midi_success_start: float = 0.65  # 이 성공률(EMA)부터 MIDI 섞기 시작 (성공률이 0.8 부근서 정체 → 문턱 낮춤)
+    midi_success_full: float = 0.90   # 이 성공률에서 final_ratio 도달
+    midi_final_ratio: float = 0.35    # 최종 MIDI 비율 (일단 낮게 — 나머지 랜덤). 안정되면 ↑
+    midi_selection_strength: float = 0.5       # MIDI 샘플링 스코어 가중 (0=완전랜덤, 클수록 스코어 선별)
+
+    # 평가(play1.py)용 — 기본값이면 학습과 동일 (무영향). play1.py가 오버라이드
+    eval_midi_ratio: float = -1.0   # >=0이면 커리큘럼 무시하고 MIDI 비율 고정 (1.0=순수 MIDI). 레벨1/2/3
+    eval_midi_file: str = ""        # 지정 시 이 MIDI 파일만 로드. 레벨2/3
+    eval_full_song: bool = False    # True면 파일 전체를 1개 긴 악보로. 레벨3
+    eval_slow_factor: float = 1.5   # RDS slow_factor (기본=학습값 1.5). play1에서 1.0 등으로 override해 원곡 템포 테스트
+
     action_scale: float = math.pi        # 기본 관절 지령 각속도 상한
     wrist_action_scale: float = 25.0      # 손목만 상한 크게 (빠른 패시지 ~24 rad/s 커버)
 

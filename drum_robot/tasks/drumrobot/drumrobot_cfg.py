@@ -25,7 +25,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     decimation: int = 2             # 정책(Policy) 업데이트 한 번당 시뮬레이션 스텝 수
     episode_length_s: float = 5.0   # 에피소드 최대 길이 (초)
     action_space: int = 9           # 로봇 제어 차원
-    observation_space: int = 99     # 관측 차원 (+3: lookahead K(3) * 목표세기 u 1채널)
+    observation_space: int = 148    # 관측 차원. K=6 글로벌 lookahead(66) + 팔별 담당 2타(16) + 나머지(66)
     state_space: int = 0
 
     # MIDI 커리큘럼: 성공률(EMA) 기반 점진 램프 — 기본 타격 익힌 뒤 실제 MIDI(연주가능하게 가공됨) 투입

@@ -98,8 +98,8 @@ class RDSCfg:
     })
 
     # 타격 관측
-    max_lookahead_s: float = 1.0    # 최대 관측 범위 (초)
-    num_hits: int = 3               # 최대 관측 타격 개수
+    max_lookahead_s: float = 2.0    # 최대 관측 범위 (초). 팔별 forward-scan이 동일드럼 연타 너머 자기 노트를 찾도록 확대
+    num_hits: int = 6               # 최대 관측 타격 개수 (글로벌 lookahead K)
 
     # 평가(play1.py)용 — 기본값이면 학습과 동일 동작 (무영향)
     eval_midi_file: str = ""        # 지정 시 이 MIDI 파일 하나만 로드 (레벨2/3)

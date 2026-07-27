@@ -173,7 +173,18 @@ class HitDetector:
         # z 높이 확인
         in_z_range = (diff_z <= self.cfg.drum_z_range) & (diff_z >= 0.0)    # (N, 2, M)
 
-        contact_mask = in_xy_range & in_z_range
+        contact_mask = in_xy_range & in_z_range   # (N, 2, M)
+
+        # 최근접 드럼 중재: 한 스틱(팔)이 여러 드럼 반경에 동시에 들어도 '가장 가까운 드럼 하나'만 접촉 인정.
+        # 반경(0.13) 겹침 + 드럼 perturbation으로 한 번의 타격이 인접 드럼까지 타격으로 세지는 것(거짓 성공) 방지.
+        # 진짜 동시타는 스틱 2개가 각자 최근접을 잡으므로 그대로 인정됨.
+        M = contact_mask.shape[-1]
+        dist_sq = dist_xy_sq + diff_z * diff_z                              # (N, 2, M) 3D 근사거리
+        dist_masked = torch.where(contact_mask, dist_sq, torch.full_like(dist_sq, float("inf")))
+        nearest = dist_masked.argmin(dim=-1, keepdim=True)                 # (N, 2, 1) 접촉 드럼 중 최근접
+        has_contact = contact_mask.any(dim=-1, keepdim=True)               # (N, 2, 1) 접촉이 하나라도 있나
+        arange = torch.arange(M, device=contact_mask.device).view(1, 1, M)
+        contact_mask = (arange == nearest) & has_contact                   # 최근접 드럼만 True (접촉 없으면 전부 False)
 
         return contact_mask
 

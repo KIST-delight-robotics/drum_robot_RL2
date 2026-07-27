@@ -456,6 +456,15 @@ class DrumRobotEnv(DirectRLEnv):
         te_cnt = te_valid.sum(dim=-1)                                       # (N,) 유효 개수
         rate_log_terms["avg_time_error_ms"] = torch.stack([te_sum, te_cnt], dim=-1)  # 합/개수 비율
 
+        # 동시타(case2) 성공률 진단: 같은 스텝에 2+ 드럼이 함께 마감된 그룹의 드럼별 성공률.
+        # finalized = 이번 스텝 마감 타겟(성공∪미스). 한 env에서 2개↑ 마감 = 동시타 그룹.
+        # n(=count)은 동시타 그룹 드럼 개수 → 빈도도 같이 보임. (3+ 동시타는 손2개라 최대 2/3라 rate 상한 있음)
+        finalized = success.bool() | missed_target.bool()                   # (N, M)
+        is_double = (finalized.sum(dim=-1, keepdim=True) >= 2)              # (N, 1) 동시 2+ 타겟 그룹
+        dbl_succ = (success.bool() & is_double).sum(dim=-1).float()         # (N,)
+        dbl_tgt  = (finalized & is_double).sum(dim=-1).float()             # (N,)
+        rate_log_terms["double_success_rate"] = torch.stack([dbl_succ, dbl_tgt], dim=-1)
+
         # 로그 출력
         self.logger.add(log_terms)
         self.logger.add_probability(rate_log_terms)

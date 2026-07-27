@@ -74,6 +74,8 @@ class DrumRobotEnv(DirectRLEnv):
             slow_factor=self.cfg.eval_slow_factor,    # 기본 1.5=학습과 동일. play1에서 override 가능
         )
         max_lookahead_step = int(rds_cfg.max_lookahead_s / self.step_dt)
+        self.max_lookahead_step = max_lookahead_step             # 스케줄러: 정규화 time→스텝 환산용
+        self.hit_window_step = hit_detector_cfg.hit_window_step  # 스케줄러: 재장전 t_rearm=2W+1
         env_specs = EnvRuntimeSpec(
             num_envs=self.num_envs,
             episode_length_step=self.episode_length_step,
@@ -114,8 +116,11 @@ class DrumRobotEnv(DirectRLEnv):
         # 리프트 baseline(직전 타격 팔꿈치각) + 스윙 중 리프트 apex(최대) 추적 버퍼
         self.elbow_baseline = torch.zeros((self.num_envs, 2), device=self.device)
         self.elbow_apex_buf = torch.zeros((self.num_envs, 2), device=self.device)
-        # case1 팔 배정 히스테리시스: 직전 스텝 배정(왼팔=True). 등거리 근처 배정 튐 방지
-        self.prev_use_left = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        # 스케줄러가 정한 h0 담당(왼팔=True). 보상 배정에 주입 (1스텝 지연으로 사용)
+        self.use_left_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self.use_case1_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)  # 동시타 case2 배정 (왼팔→idx0?)
+        # 팔별 마지막 실제 타격 스텝 (스케줄러 재장전 시드용). 초기값=먼 과거 → 시작은 양팔 자유
+        self.last_hit_step = torch.full((self.num_envs, 2), -10000, dtype=torch.int64, device=self.device)
 
         # RDS
         self.rds = RDS(
@@ -177,47 +182,81 @@ class DrumRobotEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _compute_arm_schedule(self, next_hits: torch.Tensor, tip_pos: torch.Tensor, drum_pos: torch.Tensor):
-        """팔별 담당 스케줄 (greedy nearest, 시간순). 현재 팁 위치로 시드.
-        동일드럼 연타 구간은 그 팔이 계속 가까워 유지 → 반대 팔은 연타 너머 자기 노트를 배정받음.
-        Returns: per_arm_pos (N,2,NOTES,3), per_arm_time (N,2,NOTES), per_arm_valid (N,2,NOTES) bool
-          arm0=왼팔, arm1=오른팔. NOTES=self.sched_notes."""
+        """팔별 담당 스케줄 (reachability, 시간순). 현재 팁 위치로 시드.
+        각 타격을 '현재위치 + 이동가용시간(window) + 재장전(busy)'로 배정 → 거리·간격·부하가 자동 통합.
+          window = t_k − 그 팔 자유시각,  req_speed = travel/window,  busy_pen = BIG·relu(t_rearm − window)
+          score = req_speed + busy_pen  → argmin. 방금 친 팔은 busy_pen↑ → 빠른 클러스터는 양팔 분배.
+        동시 2타 이벤트는 두 드럼을 양 팔에 분배(min-cost split) → MIDI 화음도 두 손이 제대로 갈림.
+        Returns: use_left_h0 (N,)[case1 h0 왼팔?], use_case1_h0 (N,)[case2: 왼팔→idx0(높은드럼)?],
+          per_arm_pos (N,2,NOTES,3), per_arm_time (N,2,NOTES), per_arm_valid (N,2,NOTES). arm0=왼, arm1=오른."""
         N = self.num_envs
         M = len(self.instruments.all)
         K = self.rds.cfg.num_hits
         NOTES = self.sched_notes
+        L = float(self.max_lookahead_step)
+        t_rearm = float(2 * self.hit_window_step + 1)                     # 한 손 최소 재타 간격(스텝)
+        BIG = 1.0e3
 
         multihot = next_hits[:, :, :M]                                    # (N,K,M)
-        times = next_hits[:, :, M]                                        # (N,K) 정규화 time_to_hit
+        time_norm = next_hits[:, :, M]                                    # (N,K) 정규화 time_to_hit
         valid = next_hits[:, :, M + 1] > 0.5                              # (N,K)
-        drum_idx = multihot.argmax(dim=-1)                                # (N,K) 대표 드럼
-        event_pos = torch.gather(drum_pos, 1, drum_idx.unsqueeze(-1).expand(N, K, 3))  # (N,K,3)
+        # 이벤트당 상위 2개 드럼 (보상 case2의 topk와 동일 정렬: 드럼 인덱스 큰 순)
+        arange_m = torch.arange(M, device=self.device).view(1, 1, M).expand(N, K, M)
+        masked_idx = torch.where(multihot > 0.5, arange_m, torch.full_like(arange_m, -1))
+        top2 = torch.topk(masked_idx, k=2, dim=-1).values                 # (N,K,2)
+        idx0 = top2[:, :, 0].clamp(min=0); idx1 = top2[:, :, 1].clamp(min=0)
+        has2 = top2[:, :, 1] >= 0                                         # 둘째 드럼 존재 = 동시 2타
+        pos0 = torch.gather(drum_pos, 1, idx0.unsqueeze(-1).expand(N, K, 3))  # (N,K,3) 높은 드럼
+        pos1 = torch.gather(drum_pos, 1, idx1.unsqueeze(-1).expand(N, K, 3))  # (N,K,3) 둘째 드럼
+        t_step = time_norm * max(L - 1.0, 1.0)                            # (N,K) 정규화→스텝
 
-        last = tip_pos.clone()                                            # (N,2,3) 시드=현재 팁
+        proj = tip_pos.clone()                                            # (N,2,3) 팔 투영위치(시드=현재 팁)
+        # 팔 자유시각(스텝, now=0 기준). 방금 실제로 친 팔은 재장전 남은만큼 +값 → busy로 잡혀 클러스터에서 교대 유도.
+        free = ((self.last_hit_step - self.steps.unsqueeze(1)).float() + t_rearm).clamp(min=0.0)  # (N,2)
+        use_left_h0 = torch.ones(N, dtype=torch.bool, device=self.device)
+        use_case1_h0 = torch.ones(N, dtype=torch.bool, device=self.device)   # case2: True=왼팔→idx0
         per_arm_pos = drum_pos.new_zeros((N, 2, NOTES, 3))
-        per_arm_time = times.new_ones((N, 2, NOTES))                      # 기본 1.0 = 없음/멀리
+        per_arm_time = time_norm.new_ones((N, 2, NOTES))                  # 기본 1.0 = 없음/멀리
         per_arm_valid = torch.zeros((N, 2, NOTES), dtype=torch.bool, device=self.device)
         count = torch.zeros((N, 2), dtype=torch.long, device=self.device)
 
+        def arm_score(a, p, tk):
+            w = tk - free[:, a]                                           # free 이후 여유. 음수면 아직 재장전 중
+            travel = torch.linalg.norm(proj[:, a] - p, dim=-1)
+            return travel / w.clamp(min=1.0) + BIG * torch.relu(-w)       # 이동필요속도 + 미복구 페널티
+
         for k in range(K):
-            v = valid[:, k]                                               # (N,)
-            p = event_pos[:, k]                                           # (N,3)
-            t = times[:, k]                                               # (N,)
-            cL = ((last[:, 0] - p) ** 2).sum(-1)                          # (N,)
-            cR = ((last[:, 1] - p) ** 2).sum(-1)
-            assignL = v & (cL <= cR)
-            assignR = v & (cL > cR)
-            for a, assign_a in ((0, assignL), (1, assignR)):
-                can = assign_a & (count[:, a] < NOTES)
+            v = valid[:, k]
+            two = v & has2[:, k]                                          # 동시 2타
+            one = v & (~has2[:, k])                                       # 단일
+            p0 = pos0[:, k]; p1 = pos1[:, k]; tk = t_step[:, k]; tn = time_norm[:, k]
+            sL0 = arm_score(0, p0, tk); sR0 = arm_score(1, p0, tk)
+            sL1 = arm_score(0, p1, tk); sR1 = arm_score(1, p1, tk)
+            choose_left_one = sL0 <= sR0                                  # 단일: p0를 어느 팔에
+            useA = (sL0 + sR1) <= (sL1 + sR0)                             # 2타: A(왼→p0,오른→p1) vs B(swap)
+            if k == 0:
+                use_left_h0 = torch.where(one, choose_left_one, use_left_h0)
+                use_case1_h0 = torch.where(two, useA, use_case1_h0)
+            # 팔별 이번 이벤트 타겟: 단일=담당팔만 p0 / 2타=양팔 각자 split
+            left_gets = (one & choose_left_one) | two
+            right_gets = (one & (~choose_left_one)) | two
+            left_pos = torch.where(two.unsqueeze(-1), torch.where(useA.unsqueeze(-1), p0, p1), p0)
+            right_pos = torch.where(two.unsqueeze(-1), torch.where(useA.unsqueeze(-1), p1, p0), p0)
+            for a, gets, gp in ((0, left_gets, left_pos), (1, right_gets, right_pos)):
+                can = gets & (count[:, a] < NOTES)
                 rows = torch.where(can)[0]
                 if rows.numel() > 0:
                     s = count[rows, a]
-                    per_arm_pos[rows, a, s] = p[rows]
-                    per_arm_time[rows, a, s] = t[rows]
+                    per_arm_pos[rows, a, s] = gp[rows]
+                    per_arm_time[rows, a, s] = tn[rows]
                     per_arm_valid[rows, a, s] = True
                     count[rows, a] = count[rows, a] + 1
-            last[:, 0] = torch.where(assignL.unsqueeze(-1), p, last[:, 0])
-            last[:, 1] = torch.where(assignR.unsqueeze(-1), p, last[:, 1])
-        return per_arm_pos, per_arm_time, per_arm_valid
+            new_free = tk + t_rearm
+            proj[:, 0] = torch.where(left_gets.unsqueeze(-1), left_pos, proj[:, 0])
+            proj[:, 1] = torch.where(right_gets.unsqueeze(-1), right_pos, proj[:, 1])
+            free[:, 0] = torch.where(left_gets, new_free, free[:, 0])
+            free[:, 1] = torch.where(right_gets, new_free, free[:, 1])
+        return use_left_h0, use_case1_h0, per_arm_pos, per_arm_time, per_arm_valid
 
     def _get_observations(self) -> dict:
         # 로봇의 관절 위치
@@ -233,8 +272,9 @@ class DrumRobotEnv(DirectRLEnv):
         # 다음 타격
         self.next_hits = self.rds.get_next_hits(self.steps)
 
-        # 팔별 담당 스케줄 (obs + 노는팔 접근보상용). 1스텝 지연으로 다음 _get_rewards에서 사용
-        self.per_arm_pos, self.per_arm_time, self.per_arm_valid = self._compute_arm_schedule(
+        # 팔별 담당 스케줄 (reachability). obs + 노는팔 접근보상 + 보상 h0 배정(use_left)에 사용.
+        # 1스텝 지연으로 다음 _get_rewards에서 사용 (arm_role과 동일한 지연 — 60Hz라 무시 가능).
+        self.use_left_h0, self.use_case1_h0, self.per_arm_pos, self.per_arm_time, self.per_arm_valid = self._compute_arm_schedule(
             self.next_hits, tip_pos, drum_pos)
 
         obs = self._normalize_and_pack_obs(
@@ -328,6 +368,8 @@ class DrumRobotEnv(DirectRLEnv):
         hit_arm_any = hit_per_arm.any(dim=-1)                                   # (N, 2)
         self.elbow_baseline = torch.where(hit_arm_any, elbow_angle, self.elbow_baseline)
         self.elbow_apex_buf = torch.where(hit_arm_any, torch.zeros_like(self.elbow_apex_buf), self.elbow_apex_buf)
+        # 팔별 마지막 타격 스텝 갱신 (스케줄러가 재장전 중인 팔을 알도록). self.steps는 이미 증가된 현재 스텝
+        self.last_hit_step = torch.where(hit_arm_any, self.steps.unsqueeze(1), self.last_hit_step)
 
         # 결과
         rds = self.rds.get_rds()
@@ -352,7 +394,7 @@ class DrumRobotEnv(DirectRLEnv):
         wrist_pos = self.robot_interface.get_wrist_pos(self.robot)  # (N, 2, 3)
         elbow_pos = self.robot_interface.get_elbow_pos(self.robot)  # (N, 2, 3)
 
-        reward, log_terms, rate_log_terms, active_arm, use_left = self.reward_computer.compute(
+        reward, log_terms, rate_log_terms, active_arm = self.reward_computer.compute(
             success=success,
             wrong_hit=wrong_hit,
             missed_target=missed_target,
@@ -378,11 +420,9 @@ class DrumRobotEnv(DirectRLEnv):
             target_velocity=target_velocity,
             success_elbow_apex=success_elbow_apex,
             target_T=target_T,
-            prev_use_left=self.prev_use_left,
+            assigned_use_left=self.use_left_h0,
+            assigned_use_case1=self.use_case1_h0,
         )
-
-        # 배정 히스테리시스 상태 갱신 (다음 스텝 sticky 기준)
-        self.prev_use_left = use_left
 
         # 팔별 역할 저장 (다음 스텝 관측에 사용 — 보행 위상클럭 격)
         self.arm_role = active_arm
@@ -455,7 +495,9 @@ class DrumRobotEnv(DirectRLEnv):
         elbow_angle = self.robot_interface.get_joint_pos(self.robot)[:, self.elbow_joint_ids]
         self.elbow_baseline[env_ids] = elbow_angle[env_ids]
         self.elbow_apex_buf[env_ids] = 0.0
-        self.prev_use_left[env_ids] = True   # 배정 히스테리시스 초기화
+        self.use_left_h0[env_ids] = True   # 스케줄러 h0 배정 초기화
+        self.use_case1_h0[env_ids] = True
+        self.last_hit_step[env_ids] = -10000   # 재장전 상태 초기화 (시작은 자유)
 
         # 텐서 변수들 리셋
         self._reset_tensors(env_ids)

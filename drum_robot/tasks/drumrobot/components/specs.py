@@ -52,16 +52,17 @@ class RobotSpec:
     tip_offset_right: tuple[float, float, float] = (0.385, 0.0, -0.026)  # [m]
 
     # 관절 제한 범위
+    # 실기 관절 가동범위 (deg). 손목은 실측값(-108~35/-108~135)으로 수정 — 기존 -10~90 은 틀림.
     joint_limit: dict[str, tuple[float, float]] = field(default_factory=lambda: {
         "waist_joint":          (-90*math.pi/180,    90*math.pi/180),
-        "left_shoulder_1":      ( 30*math.pi/180,   180*math.pi/180),
-        "left_shoulder_2":      (-60*math.pi/180,    90*math.pi/180),
-        "left_elbow":           (  0*math.pi/180,   140*math.pi/180),
-        "right_shoulder_1":     (  0*math.pi/180,   150*math.pi/180),
-        "right_shoulder_2":     (-60*math.pi/180,    90*math.pi/180),
-        "right_elbow":          (  0*math.pi/180,   140*math.pi/180),
-        "left_wrist":           (-10*math.pi/180,    90*math.pi/180),
-        "right_wrist":          (-10*math.pi/180,    90*math.pi/180),
+        "left_shoulder_1":      ( 30*math.pi/180,   175*math.pi/180),
+        "left_shoulder_2":      (-60*math.pi/180,    85*math.pi/180),
+        "left_elbow":           (  16*math.pi/180,   135.5*math.pi/180),
+        "right_shoulder_1":     (  0*math.pi/180,   145*math.pi/180),
+        "right_shoulder_2":     (-60*math.pi/180,    85*math.pi/180),
+        "right_elbow":          (  16*math.pi/180,   135.5*math.pi/180),
+        "left_wrist":           (-30*math.pi/180,  69*math.pi/180),
+        "right_wrist":          (-30*math.pi/180,   69*math.pi/180),
     })
 
     # 로봇 좌표계와 USD 파일의 방향 차이

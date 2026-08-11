@@ -92,6 +92,23 @@ class DrumRobotEnv(DirectRLEnv):
             env_origins=self.scene.env_origins,
         )
 
+        # ===== sim 물리 관절한계를 specs.joint_limit 값으로 재설정 (전 9관절) =====
+        #   USD 기본 한계가 ±180(사실상 무한)이라 실제 관절이 하드클램프 target을 관성 오버슈트(특히 compliant 손목).
+        #   PhysX 하드 한계를 specs 값으로 → 물리적 초과 불가. specs.py 어느 값 바꿔도 전 관절 자동 반영.
+        #   robot 프레임 한계 → USD 프레임(dir 부호변환; dir=-1이면 [lo,hi]→[-hi,-lo]로 구간 뒤집힘).
+        ri = self.robot_interface
+        _d = ri.dir_tensor.float()                                  # (1,9) ±1
+        _usd_a = _d * ri.joint_low                                  # robot→usd
+        _usd_b = _d * ri.joint_high
+        _usd_low  = torch.minimum(_usd_a, _usd_b)                   # (1,9)
+        _usd_high = torch.maximum(_usd_a, _usd_b)
+        _limits = torch.stack([_usd_low, _usd_high], dim=-1)        # (1,9,2)
+        _limits = _limits.expand(self.num_envs, -1, -1).contiguous()
+        self.robot.write_joint_position_limit_to_sim(
+            _limits, joint_ids=ri.get_ctrl_joint_ids(), warn_limit_violation=False,
+        )
+        print("[LIMIT] sim 물리 관절한계 = specs.joint_limit 로 재설정 (전 9관절)")
+
         # 관절별 action_scale (손목만 상한 크게 → 손목 스냅 가능). ctrl_joint_names는 resolve된 순서
         ctrl_joint_names = self.robot_interface.get_ctrl_joint_name()
         scale_list = [
@@ -101,6 +118,15 @@ class DrumRobotEnv(DirectRLEnv):
         self.action_scale_vec = torch.tensor(
             scale_list, device=self.device, dtype=torch.float32
         ).unsqueeze(0)  # (1, 9)
+
+        # 관절 한계-초과 로그용 짧은 이름 (ctrl 순서). lim/<이름> 으로 출력됨
+        _short = {
+            "waist_joint": "waist",
+            "left_shoulder_1": "Lsh1", "left_shoulder_2": "Lsh2", "left_elbow": "Lelb",
+            "right_shoulder_1": "Rsh1", "right_shoulder_2": "Rsh2", "right_elbow": "Relb",
+            "left_wrist": "Lwr", "right_wrist": "Rwr",
+        }
+        self.limit_log_names = [_short.get(n, n) for n in ctrl_joint_names]
 
         # 손목 관절 인덱스 [왼, 오] (손목 각속도 계산용). hit_per_arm 팔 축(0=왼,1=오)과 맞춤
         name_to_idx = {name: i for i, name in enumerate(ctrl_joint_names)}
@@ -113,6 +139,14 @@ class DrumRobotEnv(DirectRLEnv):
             [name_to_idx["left_elbow"], name_to_idx["right_elbow"]],
             device=self.device, dtype=torch.long,
         )
+        # [진단] 팔별 gross(위치이동) 관절 인덱스 [왼3, 오3] = 어깨1·어깨2·팔꿈치. 손목/허리 제외.
+        #   접근 중 |action| 포화도(=최대속도 명령 여부) 측정용 → miss가 속도한계냐 예측부족이냐 판별
+        self.arm_gross_ids = torch.tensor([
+            [name_to_idx["left_shoulder_1"],  name_to_idx["left_shoulder_2"],  name_to_idx["left_elbow"]],
+            [name_to_idx["right_shoulder_1"], name_to_idx["right_shoulder_2"], name_to_idx["right_elbow"]],
+        ], device=self.device, dtype=torch.long)   # (2, 3)
+        # [진단] 허리 인덱스 (타격 순간 몸통 회전량 관찰 — "허리 고정 → 어깨 과꺾임" 가설 확인용)
+        self.waist_idx = name_to_idx["waist_joint"]
         # 리프트 baseline(직전 타격 팔꿈치각) + 스윙 중 리프트 apex(최대) 추적 버퍼
         self.elbow_baseline = torch.zeros((self.num_envs, 2), device=self.device)
         self.elbow_apex_buf = torch.zeros((self.num_envs, 2), device=self.device)
@@ -337,6 +371,7 @@ class DrumRobotEnv(DirectRLEnv):
             hit_mask,
             tip_vel, prev_tip_pos,
             prev_hit_armed, hit_per_arm,
+            xy_in_any, xyz_in_any, dist_xy,
         ) = self.hit_detector.detect_hit(tip_pos=tip_pos, drum_pos=self.drum_pos)
 
         # 관절각, 관절 속도 (손목 각속도 계산 위해 먼저 가져옴)
@@ -362,7 +397,12 @@ class DrumRobotEnv(DirectRLEnv):
         self.rds.set_rds_visit(
             steps=self.steps, hit_mask=hit_mask,
             hit_vel=hit_vel_per_drum, hit_wrist=hit_wrist_per_drum, hit_elbow_apex=hit_elbow_apex_per_drum,
+            xy_in=xy_in_any, xyz_in=xyz_in_any, dist_xy=dist_xy,
         )
+
+        # [진단] 팔별 gross |action| 포화도 (어깨1·2·팔꿈치 중 최대). 접근 중 전력질주 여부 → 속도한계 vs 예측부족
+        arm_sat = self.actions[:, self.arm_gross_ids].abs().amax(dim=-1)        # (N, 2) 0~1
+        self.rds.set_arm_sat(steps=self.steps, arm_sat=arm_sat)
 
         # 다음 사이클 위해 타격한 팔의 baseline 갱신 + apex 리셋 (리프트 계산 후에)
         hit_arm_any = hit_per_arm.any(dim=-1)                                   # (N, 2)
@@ -377,8 +417,12 @@ class DrumRobotEnv(DirectRLEnv):
         rds_visit_vel = self.rds.get_rds_visit_vel()
         rds_visit_wrist = self.rds.get_rds_visit_wrist()
         rds_visit_elbow_apex = self.rds.get_rds_visit_elbow_apex()
+        rds_visit_xy = self.rds.get_rds_visit_xy()
+        rds_visit_xyz = self.rds.get_rds_visit_xyz()
+        rds_dist_xy = self.rds.get_rds_dist_xy()
+        rds_arm_sat = self.rds.get_rds_arm_sat()
         rds_T = self.rds.get_rds_T()
-        success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_done, target_velocity, success_elbow_apex, target_T = self.hit_detector.get_result(
+        success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_done, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir, min_dist, peak_sat = self.hit_detector.get_result(
             hit_mask=hit_mask,
             steps=self.steps,
             rds=rds,
@@ -386,6 +430,10 @@ class DrumRobotEnv(DirectRLEnv):
             rds_visit_vel=rds_visit_vel,
             rds_visit_wrist=rds_visit_wrist,
             rds_visit_elbow_apex=rds_visit_elbow_apex,
+            rds_visit_xy=rds_visit_xy,
+            rds_visit_xyz=rds_visit_xyz,
+            rds_dist_xy=rds_dist_xy,
+            rds_arm_sat=rds_arm_sat,
             rds_T=rds_T,
         )
 
@@ -442,13 +490,6 @@ class DrumRobotEnv(DirectRLEnv):
         # 가중치 업데이트
         self.reward_computer.update_difficulty_weights(success=success, missed_target=missed_target)
 
-        # 추종오차 진단 (|목표 − 현재|, rad). 운동학 가정 검증용. USD 프레임 = 부호뒤집기라 |오차| 프레임 무관
-        ctrl_ids = self.robot_interface.get_ctrl_joint_ids()
-        current_usd = self.robot.data.joint_pos[:, ctrl_ids]                 # (N, 9)
-        track_err = (self.target_joint_pos - current_usd).abs()             # (N, 9)
-        log_terms["track_err_rad"] = track_err.mean(dim=-1)                 # 전 관절 평균
-        log_terms["track_err_wrist_rad"] = track_err[:, self.wrist_joint_ids].mean(dim=-1)  # 손목만
-
         # 타이밍 정밀도 진단: 성공 타격의 타겟 시각 오차 (ms). time_error는 |스텝차이|(매칭 안되면 -1)
         te_valid = (time_error >= 0).float()                                # (N, M)
         te_ms = time_error.float() * (self.step_dt * 1000.0)                # 스텝 → ms
@@ -464,6 +505,75 @@ class DrumRobotEnv(DirectRLEnv):
         dbl_succ = (success.bool() & is_double).sum(dim=-1).float()         # (N,)
         dbl_tgt  = (finalized & is_double).sum(dim=-1).float()             # (N,)
         rate_log_terms["double_success_rate"] = torch.stack([dbl_succ, dbl_tgt], dim=-1)
+
+        # ===== 교차(cross-over) 진단: miss가 날 때 노는 팔(active_arm=0)이 있었나 =====
+        #   idle 팔이 있는데 miss = 그 팔이 교차/재배정으로 구제했을 가능성 → 교차 투자 가치.
+        #   양팔 다 바쁜데 miss = 손 2개론 원래 못 침 → 교차 무의미(재장전·리치·타이밍 문제).
+        missed_any = missed_target.bool().any(dim=-1)                       # (N,) 이번 스텝 miss 발생
+        idle_arm_exists = (active_arm.sum(dim=-1) < 1.5)                    # (N,) 한 팔이라도 idle
+        rate_log_terms["miss_w_idle_arm"] = torch.stack(
+            [(missed_any & idle_arm_exists).float(), missed_any.float()], dim=-1)
+
+        # ===== [진단] miss 3분할: 팁이 타겟 윈도우 동안 어디까지 갔나 (분모=miss 수) =====
+        #   reach = xy반경에 못 옴        → 진짜 리치/이동시간   → 처방: 궤적계획/속도
+        #   zpos  = xy는 왔는데 z밖       → 접근 각도/타점높이   → 처방: 타점높이/접근각(한계무관)
+        #   dir   = xyz박스는 왔는데 미등록 → 하강X/armed X/중재밀림 → 처방: 접근방향/재장전(한계무관)
+        missed_f = missed_target.float()
+        missed_sum = missed_f.sum(dim=-1)                                    # (N,) 이번 스텝 총 miss 수
+        rate_log_terms["miss3_reach"] = torch.stack([miss_reach.float().sum(dim=-1), missed_sum], dim=-1)
+        rate_log_terms["miss3_zpos"]  = torch.stack([miss_zpos.float().sum(dim=-1),  missed_sum], dim=-1)
+        rate_log_terms["miss3_dir"]   = torch.stack([miss_dir.float().sum(dim=-1),   missed_sum], dim=-1)
+        # [진단] reach-miss 전체에서 접근한 팔의 |action| 포화도 평균 (≈1=속도한계 / <<1=예측부족)
+        reach_f = miss_reach.float()
+        sat_per_drum = peak_sat.gather(1, min_dist.argmin(dim=1))            # (N,M) 각 드럼 접근팔 포화도
+        rate_log_terms["miss3_reach_sat"] = torch.stack([(sat_per_drum * reach_f).sum(dim=-1), reach_f.sum(dim=-1)], dim=-1)
+        # 문제 드럼(현 체크포인트 최악)만 per-drum 3분할. 분모=그 드럼 miss 수
+        #   + reach-miss 시 팔별 최근접 xy거리[m] (dL/dR): 아슬(~0.15=이동시간) vs 멀리(>0.3=안 감/오배정)
+        _dnames = list(self.instruments.all.keys())
+        for nm in ("high", "hihat", "crash_l"):
+            i = _dnames.index(nm)
+            rate_log_terms[f"{nm}_m3reach"] = torch.stack([miss_reach[:, i].float(), missed_f[:, i]], dim=-1)
+            rate_log_terms[f"{nm}_m3zpos"]  = torch.stack([miss_zpos[:, i].float(),  missed_f[:, i]], dim=-1)
+            rate_log_terms[f"{nm}_m3dir"]   = torch.stack([miss_dir[:, i].float(),   missed_f[:, i]], dim=-1)
+            rmf = miss_reach[:, i].float()                                   # (N,) reach-miss 이벤트
+            rate_log_terms[f"{nm}_rmiss_dL"] = torch.stack([min_dist[:, 0, i] * rmf, rmf], dim=-1)  # 좌완 최근접(m)
+            rate_log_terms[f"{nm}_rmiss_dR"] = torch.stack([min_dist[:, 1, i] * rmf, rmf], dim=-1)  # 우완 최근접(m)
+            # reach-miss 시 '접근한 팔'(=더 가까운 팔)의 |action| 포화도. ≈1=전력질주(속도한계), <<1=여유(예측부족)
+            ca = min_dist[:, :, i].argmin(dim=1)                             # (N,) 0=좌 1=우
+            sat_i = peak_sat.gather(1, ca.unsqueeze(1)).squeeze(1)           # (N,) 접근팔 포화도
+            rate_log_terms[f"{nm}_rmiss_sat"] = torch.stack([sat_i * rmf, rmf], dim=-1)
+
+        # ===== [진단] 자세 부자연스러움: 타격 순간 어깨 과꺾임 + 허리 고정 여부 =====
+        #   sh1_frac/sh2_frac: 친 팔의 어깨1/어깨2 각도의 범위 내 위치(0=하한,1=상한). ~1=한계에 붙음=과꺾임
+        #     (어느 관절이 튀나로 리프트 vs 좌우 판별: 하나가 리프트축, 하나가 좌우축)
+        #   hit_waist_abs: 타격 순간 |허리각|[rad]. ~0=몸통 안 돌림 → "허리 고정→어깨가 대신 꺾임" 가설 확인
+        sh1_ids = self.arm_gross_ids[:, 0]                                  # (2,) [Lsh1,Rsh1]
+        sh2_ids = self.arm_gross_ids[:, 1]                                  # (2,) [Lsh2,Rsh2]
+        rng1 = (joint_high[..., sh1_ids] - joint_low[..., sh1_ids]).clamp(min=1e-6)
+        rng2 = (joint_high[..., sh2_ids] - joint_low[..., sh2_ids]).clamp(min=1e-6)
+        sh1_frac = (robot_pos[:, sh1_ids] - joint_low[..., sh1_ids]) / rng1  # (N,2) 0~1
+        sh2_frac = (robot_pos[:, sh2_ids] - joint_low[..., sh2_ids]) / rng2  # (N,2)
+        hit_any_arm = hit_per_arm.any(dim=2)                                # (N,2) 이 스텝 그 팔이 침
+        hit_cnt = hit_any_arm.float().sum(dim=1)                            # (N,)
+        rate_log_terms["hit_sh1_frac"] = torch.stack([(hit_any_arm.float() * sh1_frac).sum(dim=1), hit_cnt], dim=-1)
+        rate_log_terms["hit_sh2_frac"] = torch.stack([(hit_any_arm.float() * sh2_frac).sum(dim=1), hit_cnt], dim=-1)
+        any_hit = hit_any_arm.any(dim=1).float()                            # (N,) 이 스텝 타격 발생
+        waist_abs = robot_pos[:, self.waist_idx].abs()                      # (N,)
+        rate_log_terms["hit_waist_abs"] = torch.stack([waist_abs * any_hit, any_hit], dim=-1)
+
+        # ===== 관절 한계 초과 진단 (실제 관절각 robot_pos vs specs 하드한계) =====
+        #   lim_exceed_any = 한 관절이라도 한계 넘은 env 비율 (top-line; 0이면 없음)
+        #   lim/Lwr·Rwr    = 손목 한계 초과 비율 (compliant 손목만; stiff 관절은 항상 0이라 생략)
+        over_hi = (robot_pos - joint_high).clamp(min=0.0)          # (N,9) 상한 초과분(rad)
+        over_lo = (joint_low - robot_pos).clamp(min=0.0)           # (N,9) 하한 초과분(rad)
+        over = over_hi + over_lo                                   # (N,9) 총 초과분(rad), 범위 안=0
+        exceeded = (over > 1e-3).float()                           # (N,9) 초과 여부
+        ones_n = torch.ones(self.num_envs, device=self.device)
+        rate_log_terms["lim_exceed_any"] = torch.stack([(exceeded.sum(dim=-1) > 0).float(), ones_n], dim=-1)
+        for j, nm in enumerate(self.limit_log_names):
+            if nm not in ("Lwr", "Rwr"):   # 손목만 로깅 (stiff 관절은 항상 0)
+                continue
+            rate_log_terms[f"lim/{nm}"] = torch.stack([exceeded[:, j], ones_n], dim=-1)
 
         # 로그 출력
         self.logger.add(log_terms)

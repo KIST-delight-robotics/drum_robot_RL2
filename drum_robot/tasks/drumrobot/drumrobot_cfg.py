@@ -8,7 +8,6 @@ from isaaclab.utils import configclass              # pyright: ignore[reportMiss
 import isaaclab.sim as sim_utils                    # pyright: ignore[reportMissingImports]
 from isaaclab.actuators import ImplicitActuatorCfg  # pyright: ignore[reportMissingImports]
 
-import math # pi
 from dataclasses import dataclass, field
 
 USD_PATH = "/home/shy/RL_workspace/IsaacLab/source/extensions/drum_robot/drum_robot/assets/drum_robot/usd/drum_robot.usd"
@@ -41,7 +40,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     eval_full_song: bool = False    # True면 파일 전체를 1개 긴 악보로. 레벨3
     eval_slow_factor: float = 1.0   # RDS slow_factor. 1.0=원곡 템포(실제 연주 목표). slow_factor는 MIDI 경로에만 적용(랜덤 RDS 무관)
 
-    action_scale: float = math.pi        # 기본 관절 지령 각속도 상한
+    action_scale: float = 10.0           # 기본 관절 지령 각속도 상한 [rad/s]. π→10: 팔꿈치 먼-드럼 이동 요구치(~7.5)+PD여유 커버, 실기 velocity_limit(46) 아래. 기존 π는 gross 이동 병목 → high/hihat reach-miss 원인 [[joint-limits-corrected]]
     wrist_action_scale: float = 25.0      # 손목만 상한 크게 (빠른 패시지 ~24 rad/s 커버)
 
     # 관측값 정규화

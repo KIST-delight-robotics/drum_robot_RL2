@@ -64,6 +64,11 @@ parser.add_argument(
 )
 parser.add_argument("--midi_file", type=str, default=None, help="레벨 2/3 에서 평가할 MIDI 파일 경로")
 parser.add_argument("--slow_factor", type=float, default=None, help="RDS slow_factor override (기본 1.5=학습값, 1.0=원곡 템포)")
+parser.add_argument("--export_traj", type=str, default=None, help="env0 관절 궤적을 CSV로 저장(한 에피소드). MATLAB 확인용. --num_envs=1 권장")
+parser.add_argument("--random_drums", action="store_true", default=False,
+                    help="드럼 위치 랜덤화(DR) 유지. 기본(play1)은 실기 위치로 고정(drum_noise_scale=0)")
+parser.add_argument("--log_every", type=int, default=300,
+                    help="play1 로그 flush 주기(스텝). 짧게 하면 곡 안 끝나도 로그가 자주 뜸. 0=곡 1회마다(mode3)")
 
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
@@ -154,6 +159,33 @@ def _midi_span_seconds(path: str):
     return (first_t or 0.0), last_t
 
 
+# ===== 실기(phill-drum-robot) trajectory_log CSV 양식으로 export =====
+# 서버 trajectory_log 헤더 = "t,joint 0,...,joint 12" (13관절, 실기 모터 id 순서, 관절각 rad).
+# 그 양식과 동일하게 뽑아야 실기 재생기(REPLAY)가 변환 없이 그대로 스트리밍한다.
+# sim ctrl 관절이름 -> 실기 모터 id (motors.json id 순서)
+SIM_NAME_TO_REAL_ID = {
+    "waist_joint":      0,
+    "right_shoulder_1": 1,
+    "left_shoulder_1":  2,
+    "right_shoulder_2": 3,
+    "right_elbow":      4,
+    "left_shoulder_2":  5,
+    "left_elbow":       6,
+    "right_wrist":      7,
+    "left_wrist":       8,
+}
+NUM_REAL_JOINT = 13   # 실기 NUM_JOINT (0~8 팔, 9~10 페달, 11~12 머리)
+REAL_CTRL_DT = 0.005  # 실기 제어주기 DT_SECOND (200Hz). export CSV를 이 고정 그리드로 리샘플.
+
+
+def sim_to_real_joint_rad(real_id: int, q_sim_rad: float) -> float:
+    """sim 관절각(robot-frame rad) -> 실기 관절각(rad) 규약 변환. (규약 변환은 여기 한 곳에서만)
+    ⚠ TODO(손목): sim 손목(-10~90°) ↔ 실기 손목(-90~100°) 물리 정합 미확정 → 현재 identity.
+       (real_id 7=right_wrist, 8=left_wrist)  HW 타격 전 반드시 확정.
+    그 외 관절: sim↔real 관절각 규약 동일 가정(미검증) → identity."""
+    return q_sim_rad
+
+
 @hydra_task_config(args_cli.task, agent_cfg_entry_point)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, experiment_cfg: dict):
 
@@ -172,6 +204,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env_cfg.eval_midi_ratio = 1.0   # 세 모드 모두 순수 MIDI (랜덤 0%)
     if args_cli.slow_factor is not None:
         env_cfg.eval_slow_factor = args_cli.slow_factor   # 원곡 템포 테스트용 override (1.0 등)
+
+    # ===== export: '지정한 곡 전체 연주'를 뽑는 용도 → full-song(mode 3)으로 맞춘다 =====
+    #   midi_file 이 있으면 그 곡 전체를 처음부터 끝까지 재생한 궤적이 CSV로 저장된다.
+    #   (mode 1/2 는 마디 랜덤/부분이라 곡이 이어지지 않으므로 export 에 부적합)
+    if args_cli.export_traj is not None:
+        if args_cli.midi_file:
+            if args_cli.eval_mode != 3:
+                print(f"[EXPORT] --export_traj + --midi_file → 곡 전체 연속연주(mode 3)로 자동 설정")
+                args_cli.eval_mode = 3
+        else:
+            print("[EXPORT] 경고: --midi_file 미지정 → 랜덤 마디가 저장됩니다. "
+                  "특정 곡 전체를 뽑으려면 --midi_file <경로> 를 지정하세요.")
+
     if args_cli.eval_mode >= 2:
         if not args_cli.midi_file:
             raise ValueError("--eval_mode 2/3 은 --midi_file 이 필요합니다.")
@@ -264,15 +309,49 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     # set agent to evaluation mode
     runner.agent.set_running_mode("eval")
 
-    # [mode 3(곡 전체)에서만] 곡 1회 끝날 때마다 그 곡의 지표가 출력되도록 로거 flush 주기를 에피소드 길이에 맞춤.
-    # mode 1/2·학습은 영향 없음 (여기서만, 런타임에 play1 env 인스턴스에만 적용).
-    if args_cli.eval_mode == 3:
-        try:
-            base_env = env.unwrapped
+    # 로그 flush 주기 설정 (play1 env 인스턴스에만, 런타임). 학습/다른 스크립트 영향 없음.
+    #   --log_every N (기본 300): N 스텝마다 로그 출력 → 곡이 안 끝나도 자주 뜸. (n이 작아 rate는 다소 요동)
+    #   --log_every 0: mode3에서 곡 1회(에피소드 전체)마다 출력 (per-song 깔끔한 집계).
+    try:
+        base_env = env.unwrapped
+        if args_cli.export_traj is not None:
+            base_env.logger.cfg.interval = 10**9   # export: 중간 flush 끔 → 곡 끝에 딱 1회만 (아래 break에서 flush)
+            print("[PLAY1] export 모드 → 로그는 곡 끝에 1회만 출력")
+        elif args_cli.log_every > 0:
+            base_env.logger.cfg.interval = args_cli.log_every
+            print(f"[PLAY1] 로그 flush = {args_cli.log_every} 스텝마다 (--log_every 0 이면 곡 1회마다)")
+        elif args_cli.eval_mode == 3:
             base_env.logger.cfg.interval = base_env.episode_length_step
             print(f"[PLAY1] (mode3) 로그 flush = 곡 1회마다 (에피소드 {base_env.episode_length_step} 스텝)")
-        except Exception as e:
-            print(f"[PLAY1] 로거 주기 설정 실패(무시): {e}")
+    except Exception as e:
+        print(f"[PLAY1] 로거 주기 설정 실패(무시): {e}")
+
+    # ===== 궤적 export 준비 (env0, MATLAB 확인용) =====
+    export_base = None
+    export_rows = []
+    export_sim2real = None
+    if args_cli.export_traj is not None:
+        export_base = env.unwrapped
+        export_joint_names = export_base.robot_interface.get_ctrl_joint_name()   # sim ctrl 순서 (9)
+        # sim ctrl index -> 실기 모터 id (양식을 실기 순서로 맞추기 위함)
+        try:
+            export_sim2real = [SIM_NAME_TO_REAL_ID[n] for n in export_joint_names]
+        except KeyError as e:
+            raise ValueError(f"[EXPORT] sim 관절이름 {e} 을 실기 id로 매핑 못함 — SIM_NAME_TO_REAL_ID 확인")
+        if export_base.num_envs != 1:
+            print(f"[EXPORT] 경고: num_envs={export_base.num_envs} → env0만 기록 (--num_envs=1 권장)")
+        print(f"[EXPORT] env0 궤적 기록 → {args_cli.export_traj} "
+              f"(phill trajectory_log 양식: t,joint 0..{NUM_REAL_JOINT-1})")
+
+    # ===== play1은 드럼 위치를 실기(drum_coordinate.json) 위치로 고정 =====
+    #   학습은 드럼 DR(랜덤화)하지만, 평가/CSV export는 실기 layout으로 고정해야 재생과 일치.
+    #   nominal(specs.py Instruments) = 실기 R/L 중점(z-0.045)이라, drum_noise_scale=0 이면 실기 위치.
+    #   drum_noise_scale은 매 리셋에서 읽히므로(아래 reset 포함) 여기서 0으로 두면 전 에피소드 고정.
+    if not args_cli.random_drums:
+        env.unwrapped.instruments.drum_noise_scale = 0.0
+        print("[PLAY1] 드럼 위치 = 실기 고정 (drum_noise_scale=0, DR 끔). --random_drums 로 랜덤화 유지 가능")
+    else:
+        print(f"[PLAY1] 드럼 위치 = 랜덤화 유지 (drum_noise_scale={env.unwrapped.instruments.drum_noise_scale})")
 
     # reset environment
     obs, _ = env.reset()
@@ -292,7 +371,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            obs, _, terminated, truncated, _ = env.step(actions)
+
+        # ===== env0 관절각 기록 (실기 trajectory_log 양식: 13관절, 실기 id 순서, 관절각 rad) =====
+        if export_base is not None:
+            q_sim = export_base.robot_interface.get_joint_pos(export_base.robot)[0]   # (9,) sim rad, sim ctrl 순서
+            t = len(export_rows) * export_base.step_dt
+            q13 = [0.0] * NUM_REAL_JOINT
+            for i, rid in enumerate(export_sim2real):
+                q13[rid] = sim_to_real_joint_rad(rid, float(q_sim[i]))
+            # 페달(9,10)·머리(11,12)는 sim에 없음 → 0.0 placeholder (재생기가 현재값으로 홀드)
+            export_rows.append([t] + q13)
+            if bool(terminated[0].item()) or bool(truncated[0].item()):
+                print(f"[EXPORT] 에피소드 종료 — {len(export_rows)} 스텝")
+                try:
+                    with torch.inference_mode():   # 로거 텐서가 inference tensor라 리셋(zero_)도 inference 모드 안에서
+                        export_base.logger.flush(prefix="(곡 전체 집계)")   # 곡 끝에 로그 1회 출력
+                except Exception as e:
+                    print(f"[PLAY1] 최종 로그 flush 실패(무시): {e}")
+                break
+
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video
@@ -303,6 +401,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    # ===== 궤적 CSV 저장 (실기 trajectory_log 양식: "t,joint 0,...,joint 12", 실기 200Hz 고정 그리드) =====
+    #   sim 정책주기(step_dt=1/60)로 기록 → 실기 제어주기(0.005s=200Hz)로 선형보간 리샘플.
+    #   행당 dt가 실기와 동일(0.005)해져 MATLAB 0.005 가정이 그대로 맞고, 서버 로그 rate와도 일치.
+    #   (로봇이 어차피 하던 60→200Hz 보간을 export 단에서 미리 수행 = "보는 것 = 실행되는 것")
+    if export_base is not None and len(export_rows) > 0:
+        import csv
+        import numpy as np
+        arr = np.asarray(export_rows, dtype=np.float64)     # (N, 1+13): col0=t(초), col1..13=관절 rad
+        t_src = arr[:, 0]
+        n_out = int(round(t_src[-1] / REAL_CTRL_DT)) + 1
+        t_dst = np.arange(n_out) * REAL_CTRL_DT
+        res = np.empty((n_out, arr.shape[1]), dtype=np.float64)
+        res[:, 0] = t_dst
+        for c in range(1, arr.shape[1]):
+            res[:, c] = np.interp(t_dst, t_src, arr[:, c])  # 각 관절을 200Hz 그리드로 선형보간
+        with open(args_cli.export_traj, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t"] + [f"joint {k}" for k in range(NUM_REAL_JOINT)])   # 서버 Logger 헤더와 동일
+            w.writerows(res.tolist())
+        print(f"[EXPORT] 저장 완료: {len(export_rows)} 스텝(60Hz) → {n_out} 행(200Hz, dt={REAL_CTRL_DT}s) "
+              f"× {NUM_REAL_JOINT}관절 (phill 양식) → {args_cli.export_traj}")
 
     # close the simulator
     env.close()

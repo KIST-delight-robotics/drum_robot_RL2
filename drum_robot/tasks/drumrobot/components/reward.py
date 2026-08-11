@@ -460,6 +460,7 @@ def _global_penalties(
         joint_low: torch.Tensor,
         joint_high: torch.Tensor,
         limit_margin: float,
+        limit_joint_mask: torch.Tensor,
         joint_vel_weight: torch.Tensor,
         action_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -472,7 +473,7 @@ def _global_penalties(
 
     low_v = torch.clamp((joint_low + limit_margin) - robot_pos, min=0.0)
     high_v = torch.clamp(robot_pos - (joint_high - limit_margin), min=0.0)
-    limit_pen = torch.sum(low_v * low_v + high_v * high_v, dim=-1)
+    limit_pen = torch.sum((low_v * low_v + high_v * high_v) * limit_joint_mask, dim=-1)  # 손목=0 (손목은 wrist_limit_pen에서 전담)
 
     return action_l2, joint_vel_l2, limit_pen, power_l1
 
@@ -485,9 +486,6 @@ def compute_rewards(
 
         proximity_cost: torch.Tensor,
         progress_reward: torch.Tensor,
-
-        upward_reward: torch.Tensor,
-        downward_reward: torch.Tensor,
 
         action_l2: torch.Tensor,
         joint_vel_l2: torch.Tensor,
@@ -503,9 +501,6 @@ def compute_rewards(
 
         w_progress: float,
         w_proximity: float,
-
-        w_upward: float,
-        w_downward: float,
 
         w_action: float,
         w_joint_vel: float,
@@ -539,9 +534,6 @@ def compute_rewards(
         - w_proximity * proximity_cost
         + w_progress * progress_reward
 
-        + w_upward * upward_reward
-        + w_downward * downward_reward
-
         + w_impact_vel * impact_vel_reward
         + w_wrist_snap * wrist_snap_reward
         + w_intensity * intensity_reward
@@ -564,7 +556,8 @@ def compute_rewards(
 @dataclass
 class RewardComputerCfg:
     # 하이퍼 파라미터
-    limit_margin: float = 0.08
+    limit_margin: float = 0.10   # 한계 몇 rad 전부터 패널티 시작 (오버슈트 제동거리). 0.08→0.10
+    wrist_limit_margin: float = 0.20   # 손목 전용 한계 margin (컴플라이언트 오버슈트 제동 → 일반 0.10보다 큼)
     k_accuracy: float = 1.0
     k_time_to_hit: float = 3.0
     k_align: float = 40.0   # downward 보상 XY 정렬 게이트 (XY 제곱거리 기준, 13cm≈0.51)
@@ -598,7 +591,7 @@ class RewardComputerCfg:
     drum_z_margin: float = 0.05
 
     # 가중치
-    w_success: float = 5.0
+    w_success: float = 5.5
     w_wrong: float = 3.0 #1.5
     w_miss: float = 3.0
     w_time_accuracy: float = 3.0
@@ -606,15 +599,12 @@ class RewardComputerCfg:
     w_progress: float = 4.0
     w_proximity: float = 1.5
 
-    w_upward: float = 0 #0.4
-    w_downward: float = 0 #0.5
-
-    # === phase-1 "결정적 타격" 보상 (w_upward/downward=0이라 이게 유일한 "빠르게 내리쳐라" 신호) ===
+    # === phase-1 "결정적 타격" 보상 ("빠르게 내리쳐라" 신호) ===
     # 세기 매칭이 켜지면 크로스페이드로 페이드아웃 (무조건 "세게" → "목표만큼"). 검증된 베이스 유지가 목적.
     w_impact_vel: float = 3.0
     impact_vel_max: float = 1.0
     w_wrist_snap: float = 3.0
-    wrist_snap_max: float = 12.0   # 정규화 기준 (실측 느긋 7~13 rad/s의 중간)
+    wrist_snap_max: float = 12.0   # 정규화 기준 -> 추후 수정 필요
 
     # === 세기(dynamics): MIDI velocity → 복합 목표(충격속도+손목ω), 목표-상대 exp 매칭 ===
     # [[intensity-teaching-design]]. velocity(0~127) u=vel/127 → 물리 목표 선형 매핑.
@@ -645,18 +635,25 @@ class RewardComputerCfg:
     w_wrist_vel_scale: float = 0.001  # 손목 관절 속도 페널티 배율 (스윙 위해 완화)
     w_elbow_vel_scale: float = 0.001  # 팔꿈치 관절 속도 페널티 배율 (자연스러운 굽힘 위해 완화)
     # 기계적 일률 |τ·q̇| 페널티. 헛스윙은 후반 현상이므로 성공률 게이팅으로 나중에 켬 (초기 탐색 방해 방지)
-    w_power_max: float = 0.05          # 램프 최대치 (성공률 full 이상에서 도달)
+    w_power_max: float = 0.05         # 램프 최대치 (성공률 full 이상). 0.1→0.05: 무거운 몸통(허리) 회전 τ·q̇ 벌점 완화 → 허리 틀어 자연 도달 유도 (헛스윙 재발 감시 [[idle-arm-swing-solved]])
     w_power_success_start: float = 0.6  # 이 성공률(EMA)부터 페널티 켜기 시작
-    w_power_success_full: float = 0.85  # 이 성공률(EMA)에서 최대치 도달
+    w_power_success_full: float = 0.77  # 이 성공률(EMA)에서 최대치 도달
     w_power_ema_beta: float = 0.9       # 성공률 EMA 평활 계수
 
     # 전용 허리 속도 페널티 Σ(허리 각속도)². 몸통 고정 유도. 위 성공률 램프 재사용(w_waist_eff)
-    w_waist_max: float = 0.1            # 램프 최대치. 작게 시작 → waist_vel_pen 로그로 보정, 먼 드럼 감시
-    w_limit: float = 0.5
+    w_waist_max: float = 0.0             # 0.05→0: 전용 허리 페널티 제거. 몸통 틀어 자연 도달 허용(과꺾임 대신 허리) — 보상은 안 줌(게임방지), 타격보상에 이끌려 필요한 만큼만 recruit
+    w_limit: float = 1.0          # 관절한계 오버슈트 페널티(비손목 7관절). 0.5→
+    w_wrist_limit: float = 1.5    # 손목 전용 한계 페널티 (일반 limit_pen은 마스크로 손목 제외)
     w_tip_limit: float = 0.15
     w_under_drum: float = 0.1 #0.08
     w_self_collision: float = 0.5
-    self_collision_threshold: float = 0.10  # 스틱 간 거리 임계값 [m]
+    self_collision_threshold: float = 0.10  # 전완(elbow→wrist) 선분 간 거리 임계값 [m]
+    # ⚠️ 스틱 '근접(5cm)' 페널티 재도입 금지: 같은드럼 교대연타의 필수 근접(좁은V 자루)까지 벌줘서
+    #   회피책으로 반대편 접근(over/under)→상시 X자 자세를 학습시킴(fresh X자 버그). X자는 다음 드럼 이동을 막아 miss 유발.
+    # 접촉-한정 스틱 페널티(B안): 임계=스틱 두께 스케일(2.5cm) → 올바른 기술 안에서 만족 가능한 제약 (X 재구조화 압력 없음).
+    #   세기 램프(0.7~0.8)와 동일 게이팅 + resume 전용. X징후(hit_sh_frac↑/forearm_dist↓) 뜨면 즉시 폐기.
+    w_stick_contact_max: float = 4.0        # 램프 최대치 (완전접촉시 0.1/step, 접촉이벤트당 ~0.4)
+    stick_contact_threshold: float = 0.025  # 진짜 접촉 스케일 [m]
 
     # 팔꿈치 최소 굽힘: 팔을 쫙 펴고(0°) 치는 부자연스러운 자세 방지. 항상 이 각도 이상 굽히도록 유도.
     # robot_pos 팔꿈치각 [0°=편, 140°=굽힘]. 이 값 미만이면 (편 정도만큼) 벌점.
@@ -706,6 +703,10 @@ class RewardComputer:
             device=self.device, dtype=torch.long,
         )
 
+        # 일반 limit_pen에서 손목 제외용 마스크 (비손목=1, 손목=0). 손목은 wrist_limit_pen에서 전담
+        self.limit_joint_mask = torch.ones((1, len(ctrl_joint_names)), device=self.device)
+        self.limit_joint_mask[0, self.wrist_ids] = 0.0
+
         # 팔꿈치 각속도 인덱스 [왼,오] (진단 로그용 — 세기↑ 때 팔꿈치가 실제로 스윙에 참여하는지 관찰). 목표 아님
         self.elbow_ids = torch.tensor(
             [name_to_idx["left_elbow"], name_to_idx["right_elbow"]],
@@ -727,6 +728,7 @@ class RewardComputer:
         self.w_power_eff = 0.0
         self.w_waist_eff = 0.0
         self.w_intensity_eff = 0.0
+        self.w_stick_eff = 0.0   # 접촉-한정 스틱 페널티 (세기 램프와 동일 게이팅)
         # phase-1 결정적 타격 보상: 초기엔 full(검증된 베이스와 동일), 세기 매칭 켜지며 페이드아웃
         self.w_impact_vel_eff = self.cfg.w_impact_vel
         self.w_wrist_snap_eff = self.cfg.w_wrist_snap
@@ -833,6 +835,7 @@ class RewardComputer:
             joint_low=joint_low,
             joint_high=joint_high,
             limit_margin=self.cfg.limit_margin,
+            limit_joint_mask=self.limit_joint_mask,
             joint_vel_weight=self.joint_vel_weight,
             action_weight=self.action_weight,
         )
@@ -846,11 +849,20 @@ class RewardComputer:
             threshold=self.cfg.self_collision_threshold,
         )
 
+        # [측정 전용] 스틱(wrist→tip) 선분 간 최소거리 — 보상 영향 없음 (거리 페널티는 X자 유발로 삭제)
+        _, stick_dist = _self_collision_penalty(
+            elbow_l=wrist_pos[:, 0, :],   # 왼 스틱 시작 = 왼 wrist
+            wrist_l=tip_pos[:, 0, :],     # 왼 스틱 끝 = 왼 tip
+            elbow_r=wrist_pos[:, 1, :],   # 오 스틱 시작 = 오 wrist
+            wrist_r=tip_pos[:, 1, :],     # 오 스틱 끝 = 오 tip
+            threshold=0.0,                 # 페널티 0 — 거리만 사용
+        )
+
         # phase-1 결정적 타격 보상 (성공 타격에 대해 하강속도/손목ω 자체에 보상). 세기 매칭 켜지면 페이드아웃.
         impact_vel_reward = (success_impact_vel / (self.cfg.impact_vel_max + 1e-8)).sum(dim=1)  # (N,)
         wrist_snap_reward = (success_wrist_ang_vel / (self.cfg.wrist_snap_max + 1e-8)).sum(dim=1)  # (N,)
 
-        # 세기(dynamics) 매칭 — C++ 실기 T-종속 공식: 목표 = 세기(i)·간격(T)의 함수. [[t-dependent-intensity-targets]]
+        # 세기(dynamics) 매칭 — T-종속 공식: 목표 = 세기(i)·간격(T)의 함수. [[t-dependent-intensity-targets]]
         # 손목ω가 주력(임팩트), 팔꿈치 리프트는 형태(윈드업, threshold i>3). impact 매칭은 손목과 중복이라 제거.
         d2r = 3.141592653589793 / 180.0
         u = target_velocity / 127.0                                          # (N, M) 0~1
@@ -894,9 +906,6 @@ class RewardComputer:
             proximity_cost=proximity_cost,
             progress_reward=progress_reward,
 
-            upward_reward=upward_reward,
-            downward_reward=downward_reward,
-
             action_l2=action_l2,
             joint_vel_l2=joint_vel_l2,
             power_l1=power_l1,
@@ -912,9 +921,6 @@ class RewardComputer:
             w_progress=self.cfg.w_progress,
             w_proximity=self.cfg.w_proximity,
 
-            w_upward=self.cfg.w_upward,
-            w_downward=self.cfg.w_downward,
-            
             w_action=self.cfg.w_action,
             w_joint_vel=self.cfg.w_joint_vel,
             w_power=self.w_power_eff,
@@ -942,6 +948,21 @@ class RewardComputer:
         # 팔꿈치 최소 굽힘 페널티 (jit 밖에서 적용 — 시그니처 불변). 팔 펴고 치는 자세 억제
         reward = reward - self.cfg.w_elbow_bend * elbow_bend_pen
 
+        # 손목 전용 한계 페널티 (jit 밖 적용). 컴플라이언트 손목 오버슈트 억제 — 일반 limit_pen은 마스크로 손목 제외됨.
+        #   margin 크게(wrist_limit_margin) → 90° 도달 전에 감속 학습. 팔엔 영향 0 (손목만).
+        w_pos = robot_pos[:, self.wrist_ids]                        # (N, 2)
+        w_lo  = joint_low[:,  self.wrist_ids]                       # (1, 2)
+        w_hi  = joint_high[:, self.wrist_ids]
+        wm = self.cfg.wrist_limit_margin
+        lo_v = torch.clamp((w_lo + wm) - w_pos, min=0.0)
+        hi_v = torch.clamp(w_pos - (w_hi - wm), min=0.0)
+        wrist_limit_pen = torch.sum(lo_v * lo_v + hi_v * hi_v, dim=-1)   # (N,)
+        reward = reward - self.cfg.w_wrist_limit * wrist_limit_pen
+
+        # 접촉-한정 스틱 페널티 (B안): 2.5cm 미만 '진짜 접촉'만. success-gate(w_stick_eff, 세기 램프와 동일 0.7~0.8)
+        stick_contact_pen = torch.clamp(self.cfg.stick_contact_threshold - stick_dist, min=0.0)
+        reward = reward - self.w_stick_eff * stick_contact_pen
+
         num_hit_drum = success.float() + missed_target.float()
 
         num_hit = num_hit_drum.float().sum(dim=-1)
@@ -953,8 +974,6 @@ class RewardComputer:
             "reward": reward,
             "proximity": proximity_cost,
             "progress(x100)": progress_reward * 100,
-            "upward": upward_reward,
-            "downward": downward_reward,
             "action_l2": action_l2,
             "joint_vel_l2": joint_vel_l2,
             "power_l1": power_l1,
@@ -963,18 +982,14 @@ class RewardComputer:
             "shoulder_ang_vel": robot_vel[:, self.shoulder_ids].abs().mean(dim=-1),
             "elbow_ang_vel": robot_vel[:, self.elbow_ids].abs().mean(dim=-1),
             "waist_vel_pen": waist_vel_pen,
-            "elbow_bend_pen": elbow_bend_pen,
             "elbow_angle_min": robot_pos[:, self.elbow_ids].min(dim=-1).values,  # 양팔 중 더 편 팔꿈치각(진단)
             "w_waist_eff(x100)": torch.full_like(reward, self.w_waist_eff * 100.0),
             "ready_pose": ready_pose_reward,
-            "limit_pen(x100)": limit_pen * 100,
-            "tip_limit_pen": tip_limit_pen,
-            "under_drum_pen": under_drum_pen,
-            "off_target_pen": off_target_pen,
+            "wrist_limit_pen(x100)": wrist_limit_pen * 100,
             "crowd_pen": crowd_pen,
             "self_collision_pen": self_col_pen,
             "forearm_dist": forearm_dist,
-            "impact_vel": impact_vel_reward,
+            "stick_dist": stick_dist,
             "wrist_snap": wrist_snap_reward,
             "intensity_reward": intensity_reward,
             "w_intensity_eff": torch.full_like(reward, self.w_intensity_eff),
@@ -996,14 +1011,12 @@ class RewardComputer:
         elbow_vel_abs = robot_vel[:, self.elbow_ids].abs()                # (N, 2)
         elbow_vel_sum = (hit_any_per_arm.float() * elbow_vel_abs).sum(dim=1)  # (N,)
 
-        # 드럼별 타격 속도 (m/s): 팔의 하강 속도를 그 팔이 친 드럼에 배분
-        vel_per_drum = (hit_per_arm.float() * down_vel_ms[:, :, None]).sum(dim=1)  # (N, M)
-        hit_per_drum = hit_per_arm.float().sum(dim=1)                             # (N, M)
-
         rate_log_terms = {
             "success_rate": torch.stack([num_success, num_hit], dim=-1),
             "wrong_rate": torch.stack([num_wrong, num_hit], dim=-1),
             "miss_rate": torch.stack([num_missed, num_hit], dim=-1),
+            # 스틱 접촉률: 임계(2.5cm) 미만인 스텝 비율 → 0으로 수렴해야 성공
+            "stick_contact": torch.stack([(stick_dist < self.cfg.stick_contact_threshold).float(), torch.ones_like(stick_dist)], dim=-1),
             "avg_impact_vel_ms": torch.stack([vel_sum, hit_arm_count], dim=-1),
             "hit_wrist_ang_vel": torch.stack([wrist_vel_sum, hit_arm_count], dim=-1),
             "hit_elbow_ang_vel": torch.stack([elbow_vel_sum, hit_arm_count], dim=-1),
@@ -1013,7 +1026,6 @@ class RewardComputer:
             rate_log_terms[f"{name}_success_rate"] = torch.stack([success[:, i], num_hit_drum[:, i]], dim=-1)
             rate_log_terms[f"{name}_wrong_rate"]   = torch.stack([wrong_hit[:, i], num_hit_drum[:, i]], dim=-1)
             rate_log_terms[f"{name}_miss_rate"]    = torch.stack([missed_target[:, i], num_hit_drum[:, i]], dim=-1)
-            rate_log_terms[f"{name}_impact_vel"]   = torch.stack([vel_per_drum[:, i], hit_per_drum[:, i]], dim=-1)
 
         # 세기(dynamics) 진단: 성공 타격을 목표 velocity 구간(p≤48 / mf≤90 / f>90, 실측 terciles)으로 나눠
         #   달성 충격속도·손목ω 기록 → soft<mid<loud로 분리되면 다이내믹 학습된 것. + 목표 매칭 정확도(0~1).
@@ -1069,6 +1081,8 @@ class RewardComputer:
             ramp_i = (self.success_ema - self.cfg.w_intensity_success_start) / denom_i
             ramp_i = min(max(ramp_i, 0.0), 1.0)
             self.w_intensity_eff = self.cfg.w_intensity_max * ramp_i
+            # 접촉-한정 스틱 페널티도 동일 램프 (스킬 굳은 뒤에만 켬 → 초기 탐색/분지 선택 영향 0)
+            self.w_stick_eff = self.cfg.w_stick_contact_max * ramp_i
             # 크로스페이드: 세기 매칭 켜지는 만큼 무조건 "세게" 페이드아웃 (phase-1 결정적 타격 → 목표 매칭)
             self.w_impact_vel_eff = self.cfg.w_impact_vel * (1.0 - ramp_i)
             self.w_wrist_snap_eff = self.cfg.w_wrist_snap * (1.0 - ramp_i)

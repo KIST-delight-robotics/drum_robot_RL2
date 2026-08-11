@@ -83,6 +83,12 @@ class EnvLogger:
             return
         if self.step % self.cfg.interval != 0:
             return
+        self.flush(prefix)
+
+    def flush(self, prefix: str = ""):
+        # 조건 없이 현재 누적 윈도우를 출력+리셋 (export 끝 등에서 강제 1회 출력용)
+        if self._count == 0:
+            return
 
         denom = float(self._count) + 1e-6
 

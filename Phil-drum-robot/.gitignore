@@ -1,0 +1,4 @@
+# 런타임 생성물
+drumrobot_server/log/
+drumrobot_server/obj/
+drumrobot_server/bin/*.out

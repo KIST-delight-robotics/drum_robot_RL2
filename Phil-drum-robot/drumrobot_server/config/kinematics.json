@@ -1,0 +1,75 @@
+{
+    "joint_limits": [
+        {
+            "joint": 0,
+            "min_angle": -90.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 1,
+            "min_angle": 0.0,
+            "max_angle": 150.0
+        },
+        {
+            "joint": 2,
+            "min_angle": 30.0,
+            "max_angle": 180.0
+        },
+        {
+            "joint": 3,
+            "min_angle": -60.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 4,
+            "min_angle": 0.0,
+            "max_angle": 140.0
+        },
+        {
+            "joint": 5,
+            "min_angle": -60.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 6,
+            "min_angle": 0.0,
+            "max_angle": 140.0
+        },
+        {
+            "joint": 7,
+            "min_angle": -90.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 8,
+            "min_angle": -90.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 9,
+            "min_angle": -90.0,
+            "max_angle": 200.0
+        },
+        {
+            "joint": 10,
+            "min_angle": -90.0,
+            "max_angle": 200.0
+        },
+        {
+            "joint": 11,
+            "min_angle": -90.0,
+            "max_angle": 90.0
+        },
+        {
+            "joint": 12,
+            "min_angle": -90.0,
+            "max_angle": 90.0
+        }
+    ],
+    "link_length": {
+        "waist": 0.520,
+        "upper_arm": 0.230,
+        "forearm": 0.200,
+        "stick": 0.373
+    }
+}

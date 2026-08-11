@@ -1,0 +1,17 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/drumrobot_server/include",
+                "${workspaceFolder}/drumrobot_server/lib",
+                "${workspaceFolder}/drumrobot_server/lib/dynamixel_sdk/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/g++",
+            "cStandard": "c17",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}

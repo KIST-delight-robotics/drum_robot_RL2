@@ -1,0 +1,40 @@
+{
+    "play_list": {
+      "BI": {
+        "score": "BabyINeedYou",
+        "audio": "BI",
+        "init_note_r": 5,
+        "init_note_l": 1
+      },
+      "BF": {
+        "score": "BasicFillin",
+        "audio": "",
+        "init_note_r": 8,
+        "init_note_l": 1
+      },
+      "DS": {
+        "score": "DrumSolo",
+        "audio": "",
+        "init_note_r": 8,
+        "init_note_l": 1
+      },
+      "TI": {
+        "score": "ThisIsMe",
+        "audio": "TIM",
+        "init_note_r": 8,
+        "init_note_l": 1
+      },
+      "TY": {
+        "score": "ToYou",
+        "audio": "",
+        "init_note_r": 5,
+        "init_note_l": 1
+      },
+      "WS": {
+        "score": "WhySo",
+        "audio": "",
+        "init_note_r": 5,
+        "init_note_l": 1
+      }
+    }
+  }

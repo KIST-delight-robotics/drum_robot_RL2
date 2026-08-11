@@ -1,7 +1,0 @@
-{
-  "machines": {
-    "shy-desktop":            { "hub": "1-4",   "ports": [1, 2, 3, 4] },
-    "shy-MINIPC-VC66-C2":     { "hub": "1-6.1", "ports": [1] },
-    "shy":                    { "hub": "",      "ports": [] }
-  }
-}

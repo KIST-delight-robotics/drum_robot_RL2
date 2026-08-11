@@ -147,8 +147,6 @@ class RDS:
         self.rds_visit_elbow_apex = torch.zeros((N, T, M), device=self.device, dtype=torch.float32) # 타격 순간 팔꿈치 리프트 apex 기록
         self.rds_visit_xy = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)   # [진단] 팁이 xy반경 안에 든 스텝 (miss 3분할)
         self.rds_visit_xyz = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)  # [진단] 팁이 xy+z박스 안에 든 스텝 (miss 3분할)
-        self.rds_dist_xy = torch.full((N, T, 2, M), 1e3, device=self.device, dtype=torch.float32)  # [진단] 팔별 xy거리[m] (윈도우 최근접 → reach-miss 아슬/멀리)
-        self.rds_arm_sat = torch.zeros((N, T, 2), device=self.device, dtype=torch.float32)  # [진단] 팔별 gross |action| 포화도 (윈도우 최대 → 속도한계 vs 예측부족)
         self.rds_T = torch.zeros((N, T, M), device=self.device, dtype=torch.float32)   # 각 타격의 직전 타격까지 간격[s] (손목/팔꿈치 목표 T-종속) [[t-dependent-intensity-targets]]
 
         # util
@@ -233,17 +231,13 @@ class RDS:
 
         return next_hits
     
-    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor, hit_wrist: torch.Tensor, hit_elbow_apex: torch.Tensor, xy_in: torch.Tensor, xyz_in: torch.Tensor, dist_xy: torch.Tensor):
+    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor, hit_vel: torch.Tensor, hit_wrist: torch.Tensor, hit_elbow_apex: torch.Tensor, xy_in: torch.Tensor, xyz_in: torch.Tensor):
         self.rds_visit[self.env_arange, steps, :] = hit_mask         # 타격한 시간에 방문 처리
         self.rds_visit_vel[self.env_arange, steps, :] = hit_vel      # 그 시간의 타격 속도 기록
         self.rds_visit_wrist[self.env_arange, steps, :] = hit_wrist  # 그 시간의 손목 각속도 기록
         self.rds_visit_elbow_apex[self.env_arange, steps, :] = hit_elbow_apex  # 그 시간의 팔꿈치 리프트 apex 기록
         self.rds_visit_xy[self.env_arange, steps, :] = xy_in         # [진단] 그 시간 xy반경 진입 여부
         self.rds_visit_xyz[self.env_arange, steps, :] = xyz_in       # [진단] 그 시간 xy+z박스 진입 여부
-        self.rds_dist_xy[self.env_arange, steps, :, :] = dist_xy     # [진단] 그 시간 팔별 xy거리[m] (N,2,M)
-
-    def set_arm_sat(self, steps: torch.Tensor, arm_sat: torch.Tensor):
-        self.rds_arm_sat[self.env_arange, steps, :] = arm_sat        # [진단] 그 시간 팔별 gross |action| 포화도 (N,2)
 
     def get_rds(self) -> torch.Tensor:
         return self.rds
@@ -266,11 +260,6 @@ class RDS:
     def get_rds_visit_xyz(self) -> torch.Tensor:
         return self.rds_visit_xyz
 
-    def get_rds_dist_xy(self) -> torch.Tensor:
-        return self.rds_dist_xy
-
-    def get_rds_arm_sat(self) -> torch.Tensor:
-        return self.rds_arm_sat
 
     def get_rds_T(self) -> torch.Tensor:
         return self.rds_T
@@ -322,8 +311,6 @@ class RDS:
         self.rds_visit_elbow_apex[env_ids] = 0.0
         self.rds_visit_xy[env_ids] = False
         self.rds_visit_xyz[env_ids] = False
-        self.rds_dist_xy[env_ids] = 1e3
-        self.rds_arm_sat[env_ids] = 0.0
 
     # ===== INIT =====
     def _glob_midi_files(self) -> list:

@@ -50,9 +50,6 @@ class HitDetector:
         # 팁 드럼 거리 계산
         dist_xy_sq, diff_z = self._compute_tip_drum_dist_sq(tip_pos, drum_pos)
 
-        # [진단] 팔별 xy거리[m] (윈도우 중 최근접 추적용 → reach-miss가 '아슬' vs '멀리' 판별)
-        dist_xy = dist_xy_sq.clamp(min=0.0).sqrt()             # (N, 2, M)
-
         # 접촉 확인
         contact_mask, in_xy_range, in_z_range = self._check_contact_drum(dist_xy_sq, diff_z)
 
@@ -87,7 +84,7 @@ class HitDetector:
             hit_mask,
             tip_vel, prev_tip_pos,
             prev_hit_armed, hit_per_arm,
-            xy_in_any, xyz_in_any, dist_xy,
+            xy_in_any, xyz_in_any,
         )
     
     def get_result(
@@ -101,10 +98,8 @@ class HitDetector:
             rds_visit_elbow_apex: torch.Tensor,
             rds_visit_xy: torch.Tensor,
             rds_visit_xyz: torch.Tensor,
-            rds_dist_xy: torch.Tensor,
-            rds_arm_sat: torch.Tensor,
             rds_T: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # 현재 ±W 윈도우 타겟
         window_target_union = self._window_target_union(rds, steps)  # (N, M)
 
@@ -117,7 +112,7 @@ class HitDetector:
         self.target_done = self.target_done | valid_hit
 
         # 윈도우 끝났을 때 타격 성공 확인 (+ 성공 타격의 속도/손목각속도 + 그 타겟의 목표 velocity). 끝난 타겟은 done 해제
-        success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir, min_dist, peak_sat = self._finalize_target_outcomes(
+        success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir = self._finalize_target_outcomes(
             rds=rds,
             rds_visit=rds_visit,
             rds_visit_vel=rds_visit_vel,
@@ -125,13 +120,11 @@ class HitDetector:
             rds_visit_elbow_apex=rds_visit_elbow_apex,
             rds_visit_xy=rds_visit_xy,
             rds_visit_xyz=rds_visit_xyz,
-            rds_dist_xy=rds_dist_xy,
-            rds_arm_sat=rds_arm_sat,
             rds_T=rds_T,
             steps=steps,
         )
 
-        return success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, self.target_done, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir, min_dist, peak_sat
+        return success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, self.target_done, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir
     
     def reset(self, env_ids: torch.Tensor, tip_pos: torch.Tensor):
         # 팁 위치/속도 리셋
@@ -242,7 +235,7 @@ class HitDetector:
 
         return window_target_union
 
-    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, rds_visit_wrist: torch.Tensor, rds_visit_elbow_apex: torch.Tensor, rds_visit_xy: torch.Tensor, rds_visit_xyz: torch.Tensor, rds_dist_xy: torch.Tensor, rds_arm_sat: torch.Tensor, rds_T: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, rds_visit_wrist: torch.Tensor, rds_visit_elbow_apex: torch.Tensor, rds_visit_xy: torch.Tensor, rds_visit_xyz: torch.Tensor, rds_T: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # rds(값=velocity), rds_visit, rds_visit_vel, rds_visit_wrist, rds_visit_elbow_apex: (N, T, M)
         # steps: (N,)
 
@@ -272,11 +265,6 @@ class HitDetector:
         # [진단] miss 3분할용: 타겟 윈도우 동안 팁이 xy반경/xyz박스에 한 번이라도 들어왔나 (OR)
         xy_ever = torch.zeros((N, M), device=self.device, dtype=torch.bool)
         xyz_ever = torch.zeros((N, M), device=self.device, dtype=torch.bool)
-        # [진단] 윈도우 중 팔별 최근접 xy거리[m] (reach-miss '아슬 vs 멀리' + 오배정 판별)
-        min_dist = torch.full((N, 2, M), 1e3, device=self.device, dtype=torch.float32)
-        # [진단] 윈도우 중 팔별 |action| 포화도 최대 (접근 중 전력질주 여부 → 속도한계 vs 예측부족)
-        peak_sat = torch.zeros((N, 2), device=self.device, dtype=torch.float32)
-
         offsets = self._get_hit_window_offsets(W)
         for offset in offsets:
             cand_steps = window_end_step + offset
@@ -289,16 +277,6 @@ class HitDetector:
             cv = cand_valid.unsqueeze(-1) & target_mask
             xy_ever |= (rds_visit_xy[self.env_arange, cand_steps_clamped, :] > 0.5) & cv
             xyz_ever |= (rds_visit_xyz[self.env_arange, cand_steps_clamped, :] > 0.5) & cv
-
-            # 팔별 최근접 xy거리: 마감타겟 셀만, valid 스텝만 후보로 min
-            d = rds_dist_xy[self.env_arange, cand_steps_clamped, :, :]              # (N, 2, M)
-            d = torch.where(cv.unsqueeze(1), d, torch.full_like(d, 1e3))            # (N,2,M) cv=(N,M)→(N,1,M)
-            min_dist = torch.minimum(min_dist, d)
-
-            # 팔별 포화도: valid 스텝만 후보로 max (per-arm, 드럼 무관)
-            s = rds_arm_sat[self.env_arange, cand_steps_clamped, :]                 # (N, 2)
-            s = torch.where(cand_valid.unsqueeze(-1), s, torch.zeros_like(s))       # (N,2)
-            peak_sat = torch.maximum(peak_sat, s)
 
             match_mask = hit_mask & cand_valid.unsqueeze(-1) & target_mask & (~success)
 
@@ -331,7 +309,7 @@ class HitDetector:
         target_T_raw = rds_T[self.env_arange, window_end_step, :]                      # (N, M)
         target_T = torch.where(target_mask, target_T_raw, torch.zeros_like(target_T_raw))
 
-        return success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir, min_dist, peak_sat
+        return success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir
 
     def _get_hit_window_offsets(self, W: int) -> list:
         # offset 순서: [0, -1, +1, -2, +2, ...] 마스크가 "가장 작은 |offset|부터 매칭"되도록

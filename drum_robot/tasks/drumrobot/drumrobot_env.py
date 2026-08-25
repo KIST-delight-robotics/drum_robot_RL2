@@ -155,6 +155,13 @@ class DrumRobotEnv(DirectRLEnv):
         self.use_case1_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)  # 동시타 case2 배정 (왼팔→idx0?)
         # 팔별 마지막 실제 타격 스텝 (스케줄러 재장전 시드용). 초기값=먼 과거 → 시작은 양팔 자유
         self.last_hit_step = torch.full((self.num_envs, 2), -10000, dtype=torch.int64, device=self.device)
+        # 팔별 마지막으로 친 드럼 위치 — 스케줄러 배정이 없을 때 ready_pose 대기점 (움직이지 않는 기준)
+        self.last_hit_drum_pos = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
+        # ready_pose 대기점의 안정성 진단용 (배정노트 ↔ 마지막친드럼 전환 점프까지 포착)
+        self.prev_home_p = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
+        # [진단] 배정 churn 측정용 직전 스텝 값 (노는 팔 헛스윙 원인: 배정 채터링 vs 파워페널티 완화 판별)
+        self.prev_use_left_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        self.prev_arm_tgt0 = torch.zeros((self.num_envs, 2, 3), device=self.device)
 
         # RDS
         self.rds = RDS(
@@ -254,9 +261,15 @@ class DrumRobotEnv(DirectRLEnv):
         per_arm_valid = torch.zeros((N, 2, NOTES), dtype=torch.bool, device=self.device)
         count = torch.zeros((N, 2), dtype=torch.long, device=self.device)
 
+        CROSS = self.cfg.sched_cross_penalty
+
         def arm_score(a, p, tk):
             w = tk - free[:, a]                                           # free 이후 여유. 음수면 아직 재장전 중
-            travel = torch.linalg.norm(proj[:, a] - p, dim=-1)
+            # 교차 침범량[m]: 왼팔(a=0)이 우측(x>0) / 오른팔(a=1)이 좌측(x<0) 드럼을 맡을 때만 >0.
+            #   드럼 x와 팔 정체성만으로 결정 → 현재 팁 위치 무관 → '이미 교차해 travel=0' 자기강화 고리를 끊음.
+            px = p[:, 0]
+            cross = torch.relu(px) if a == 0 else torch.relu(-px)         # (N,)
+            travel = torch.linalg.norm(proj[:, a] - p, dim=-1) + CROSS * cross   # 교차를 추가 이동거리로 환산
             return travel / w.clamp(min=1.0) + BIG * torch.relu(-w)       # 이동필요속도 + 미복구 페널티
 
         for k in range(K):
@@ -266,7 +279,18 @@ class DrumRobotEnv(DirectRLEnv):
             p0 = pos0[:, k]; p1 = pos1[:, k]; tk = t_step[:, k]; tn = time_norm[:, k]
             sL0 = arm_score(0, p0, tk); sR0 = arm_score(1, p0, tk)
             sL1 = arm_score(0, p1, tk); sR1 = arm_score(1, p1, tk)
-            choose_left_one = sL0 <= sR0                                  # 단일: p0를 어느 팔에
+            # 단일: p0를 어느 팔에. k=0은 히스테리시스 적용 — 직전 담당팔을 유지하는 상대 마진.
+            #   배정엔 관성이 없어 두 팁이 등거리면 mm 단위로 승자가 뒤집히고, proj 체인 때문에 양팔 큐 전체가 스왑됨.
+            #   그게 idle 팔 타겟을 점프시켜 idle_approach가 왕복을 양방향 보상 → 헛스윙. k=0만 잡으면 뒤도 안정.
+            if k == 0:
+                h = self.cfg.sched_hysteresis
+                choose_left_one = torch.where(
+                    self.prev_use_left_h0,
+                    sL0 <= sR0 * (1.0 + h),      # 직전=왼팔 → 유지 쪽에 관대
+                    sL0 * (1.0 + h) <= sR0,      # 직전=오른팔 → 왼팔이 h만큼 확실히 나아야 뒤집힘
+                )
+            else:
+                choose_left_one = sL0 <= sR0
             useA = (sL0 + sR1) <= (sL1 + sR0)                             # 2타: A(왼→p0,오른→p1) vs B(swap)
             if k == 0:
                 use_left_h0 = torch.where(one, choose_left_one, use_left_h0)
@@ -406,6 +430,10 @@ class DrumRobotEnv(DirectRLEnv):
         self.elbow_apex_buf = torch.where(hit_arm_any, torch.zeros_like(self.elbow_apex_buf), self.elbow_apex_buf)
         # 팔별 마지막 타격 스텝 갱신 (스케줄러가 재장전 중인 팔을 알도록). self.steps는 이미 증가된 현재 스텝
         self.last_hit_step = torch.where(hit_arm_any, self.steps.unsqueeze(1), self.last_hit_step)
+        # 팔별 마지막 친 드럼 위치 갱신 (동시에 여러 드럼이면 인덱스 작은 쪽)
+        hit_drum_idx = hit_per_arm.float().argmax(dim=-1)                                    # (N,2)
+        picked_drum = torch.gather(self.drum_pos, 1, hit_drum_idx.unsqueeze(-1).expand(-1, -1, 3))
+        self.last_hit_drum_pos = torch.where(hit_arm_any.unsqueeze(-1), picked_drum, self.last_hit_drum_pos)
 
         # 결과
         rds = self.rds.get_rds()
@@ -444,7 +472,6 @@ class DrumRobotEnv(DirectRLEnv):
             drum_pos=self.drum_pos,
             next_hits=self.next_hits,
             tip_vel=tip_vel,
-            prev_hit_armed=prev_hit_armed,
             robot_vel=robot_vel,
             robot_torque=robot_torque,
             actions=self.actions,
@@ -456,12 +483,15 @@ class DrumRobotEnv(DirectRLEnv):
             hit_per_arm=hit_per_arm,
             success_impact_vel=success_impact_vel,
             success_wrist_ang_vel=success_wrist_ang_vel,
-            target_done=target_done,
             target_velocity=target_velocity,
             success_elbow_apex=success_elbow_apex,
             target_T=target_T,
             assigned_use_left=self.use_left_h0,
             assigned_use_case1=self.use_case1_h0,
+            idle_tgt_pos=self.per_arm_pos[:, :, 0, :],
+            idle_tgt_valid=self.per_arm_valid[:, :, 0],
+            idle_tgt_time=self.per_arm_time[:, :, 0],
+            last_drum_pos=self.last_hit_drum_pos,
         )
 
         # 팔별 역할 저장 (다음 스텝 관측에 사용 — 보행 위상클럭 격)
@@ -477,7 +507,6 @@ class DrumRobotEnv(DirectRLEnv):
             prev_d = torch.linalg.norm(prev_tip_pos[:, a, :] - tgt, dim=-1)
             idle_approach = idle_approach + torch.where(gate, prev_d - curr_d, torch.zeros_like(curr_d))
         reward = reward + self.reward_computer.cfg.w_idle_approach * idle_approach
-        log_terms["idle_approach"] = idle_approach
 
         # 가중치 업데이트
         self.reward_computer.update_difficulty_weights(success=success, missed_target=missed_target)
@@ -508,10 +537,8 @@ class DrumRobotEnv(DirectRLEnv):
         rate_log_terms["miss3_zpos"]  = torch.stack([miss_zpos.float().sum(dim=-1),  missed_sum], dim=-1)
         rate_log_terms["miss3_dir"]   = torch.stack([miss_dir.float().sum(dim=-1),   missed_sum], dim=-1)
 
-        # ===== [진단] 자세 부자연스러움: 타격 순간 어깨 과꺾임 + 허리 고정 여부 =====
-        #   sh1_frac/sh2_frac: 친 팔의 어깨1/어깨2 각도의 범위 내 위치(0=하한,1=상한). ~1=한계에 붙음=과꺾임
-        #     (어느 관절이 튀나로 리프트 vs 좌우 판별: 하나가 리프트축, 하나가 좌우축)
-        #   hit_waist_abs: 타격 순간 |허리각|[rad]. ~0=몸통 안 돌림 → "허리 고정→어깨가 대신 꺾임" 가설 확인
+        # ===== [진단] 타격 순간 어깨 과꺾임 =====
+        #   sh1_frac(방위축) / sh2_frac(앙각축): 친 팔의 각도가 가동범위의 몇 % 지점인가 (1.0 = 한계에 붙음)
         sh1_ids = self.arm_gross_ids[:, 0]                                  # (2,) [Lsh1,Rsh1]
         sh2_ids = self.arm_gross_ids[:, 1]                                  # (2,) [Lsh2,Rsh2]
         rng1 = (joint_high[..., sh1_ids] - joint_low[..., sh1_ids]).clamp(min=1e-6)
@@ -523,8 +550,54 @@ class DrumRobotEnv(DirectRLEnv):
         rate_log_terms["hit_sh1_frac"] = torch.stack([(hit_any_arm.float() * sh1_frac).sum(dim=1), hit_cnt], dim=-1)
         rate_log_terms["hit_sh2_frac"] = torch.stack([(hit_any_arm.float() * sh2_frac).sum(dim=1), hit_cnt], dim=-1)
         any_hit = hit_any_arm.any(dim=1).float()                            # (N,) 이 스텝 타격 발생
-        waist_abs = robot_pos[:, self.waist_idx].abs()                      # (N,)
+        hL = hit_any_arm[:, 0].float(); hR = hit_any_arm[:, 1].float()
+
+        # ===== [진단] 몸통 비틀림: 두 어깨1 각도의 합이 180°에서 벗어난 정도 =====
+        #   IK 기하상 두 shoulder_1은 같은 기준(+x)에서 재므로 각각 90°면 그 팔이 몸통 정면.
+        #   따라서 sh1_L + sh1_R = 180° = 두 팔이 몸통 기준 좌우 대칭 = 몸통이 팔들의 평균 방향을 봄.
+        #   실측 확인(프로브): sideways(팔이 정면에서 벗어난 각) = sh1 − 90°, 허리 1rad = 몸통 1rad 회전.
+        #   → 허리를 δ 돌리면 두 편차가 각각 −δ, 합은 −2δ 이동 ⇒ 허리는 '합편차의 절반'만 돌면 대칭 회복.
+        #   개별 팔이 안쪽으로 뻗는 건 자연(어깨가 몸중심에서 26cm 밖) — '한쪽 쏠림'만 문제.
+        RAD2DEG = 180.0 / 3.141592653589793
+        sh1_dev = (robot_pos[:, sh1_ids] - 1.5707963267948966) * RAD2DEG     # (N,2) 각 팔의 정면 대비 편차[°]
+        sh1_sum_dev = sh1_dev.sum(dim=-1)                                    # (N,) = (sh1_L+sh1_R) − 180°
+        rate_log_terms["hit_sh1_sumdev"] = torch.stack([sh1_sum_dev * any_hit, any_hit], dim=-1)
+        rate_log_terms["hit_sh1_devL"] = torch.stack([sh1_dev[:, 0] * hL, hL], dim=-1)  # 왼팔 타격 시 왼팔 편차
+        rate_log_terms["hit_sh1_devR"] = torch.stack([sh1_dev[:, 1] * hR, hR], dim=-1)  # 오른팔 타격 시 오른팔 편차
+        # 팔 벌어짐 = sh1_L − sh1_R [°].  0=둘 다 정면, 음수=안쪽으로 모임(스틱 근접 자세).
+        #   waist_twist는 '합'만 봐서 대칭 모임/벌림을 전혀 감지 못함 — 이게 그 맹점을 메움
+        arm_open = sh1_dev[:, 0] - sh1_dev[:, 1]                             # (N,)
+        rate_log_terms["hit_arm_open"] = torch.stack([arm_open * any_hit, any_hit], dim=-1)
+        # 허리 사용량 — 도달의 핵심 자유도(어깨가 0.26·sinθ 만큼 이동). ≈0이면 허리를 안 쓰는 것
+        waist_abs = robot_pos[:, self.waist_idx].abs()                       # (N,) |허리각|[rad]
         rate_log_terms["hit_waist_abs"] = torch.stack([waist_abs * any_hit, any_hit], dim=-1)
+
+        # ===== [진단] 배정 churn — 노는 팔 헛스윙의 원인 판별 =====
+        #   assign_flip : h0 담당팔이 직전 스텝과 뒤바뀐 비율. 배정엔 히스테리시스가 없어 등거리 근처에서 채터링 가능.
+        #                 k=0이 뒤집히면 proj 체인 때문에 양팔 큐 전체가 스왑됨.
+        #   idle_tgt_jump: 노는 팔의 첫 타겟이 5cm 이상 순간이동한 비율. idle_approach(진척보상)는 타겟 고정일 때만
+        #                 왕복이 상쇄되므로, 이 값이 크면 왕복이 양방향 모두 보상받아 헛스윙이 '학습'됨.
+        #   둘 다 ~0 이면 배정은 안정 → 원인은 파워페널티 완화(0.1→0.05) 쪽.
+        flip = (self.use_left_h0 != self.prev_use_left_h0).float()               # (N,)
+        ones_like_flip = torch.ones_like(flip)
+        rate_log_terms["assign_flip"] = torch.stack([flip, ones_like_flip], dim=-1)
+        tgt_move = torch.linalg.norm(self.per_arm_pos[:, :, 0, :] - self.prev_arm_tgt0, dim=-1)  # (N,2)
+        idle_valid = (active_arm < 0.5) & self.per_arm_valid[:, :, 0]            # (N,2) 노는 팔 & 유효 타겟
+        jumped = ((tgt_move > 0.05) & idle_valid).any(dim=1).float()             # (N,)
+        rate_log_terms["idle_tgt_jump"] = torch.stack([jumped, ones_like_flip], dim=-1)
+        # ready_pose 대기점 진단: 스케줄러 배정을 받았나 / 대기점 자체가 튀었나
+        #   idle_tgt_jump는 per_arm_pos만 봐서 has_tgt 전환(배정노트↔마지막친드럼) 점프를 놓침
+        idle_has = torch.where(self.use_left_h0, self.per_arm_valid[:, 1, 0], self.per_arm_valid[:, 0, 0])
+        sched_p  = torch.where(self.use_left_h0.unsqueeze(-1), self.per_arm_pos[:, 1, 0, :], self.per_arm_pos[:, 0, 0, :])
+        last_p   = torch.where(self.use_left_h0.unsqueeze(-1), self.last_hit_drum_pos[:, 1], self.last_hit_drum_pos[:, 0])
+        home_p   = torch.where(idle_has.unsqueeze(-1), sched_p, last_p)
+        home_move = (torch.linalg.norm(home_p - self.prev_home_p, dim=-1) > 0.05).float()
+        rate_log_terms["idle_has_tgt"]   = torch.stack([idle_has.float(), ones_like_flip], dim=-1)
+        rate_log_terms["idle_home_move"] = torch.stack([home_move, ones_like_flip], dim=-1)
+        self.prev_home_p = home_p.clone()
+
+        self.prev_use_left_h0 = self.use_left_h0.clone()
+        self.prev_arm_tgt0 = self.per_arm_pos[:, :, 0, :].clone()
 
         # ===== 관절 한계 초과 진단 (실제 관절각 robot_pos vs specs 하드한계) =====
         #   lim_exceed_any = 한 관절이라도 한계 넘은 env 비율 (top-line; 0이면 없음)
@@ -578,6 +651,13 @@ class DrumRobotEnv(DirectRLEnv):
         self.use_left_h0[env_ids] = True   # 스케줄러 h0 배정 초기화
         self.use_case1_h0[env_ids] = True
         self.last_hit_step[env_ids] = -10000   # 재장전 상태 초기화 (시작은 자유)
+        # 대기점 시드: 시작 자세(드럼 위 hover)를 그대로 대기점으로 → 에피소드 초반 ready_pose 과도현상 없음
+        seed_drum = tip_pos[env_ids].clone()
+        seed_drum[:, :, 2] = seed_drum[:, :, 2] - self.reward_computer.cfg.ready_height
+        self.last_hit_drum_pos[env_ids] = seed_drum
+        self.prev_use_left_h0[env_ids] = True  # 히스테리시스 기준 초기화 (use_left_h0와 동일하게)
+        self.prev_arm_tgt0[env_ids] = 0.0      # 진단용 직전 타겟 초기화
+        self.prev_home_p[env_ids] = 0.0        # 진단용 직전 대기점 초기화
 
         # 텐서 변수들 리셋
         self._reset_tensors(env_ids)

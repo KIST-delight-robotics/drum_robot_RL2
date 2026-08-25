@@ -40,7 +40,22 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     eval_full_song: bool = False    # True면 파일 전체를 1개 긴 악보로. 레벨3
     eval_slow_factor: float = 1.0   # RDS slow_factor. 1.0=원곡 템포(실제 연주 목표). slow_factor는 MIDI 경로에만 적용(랜덤 RDS 무관)
 
-    action_scale: float = 10.0           # 기본 관절 지령 각속도 상한 [rad/s]. π→10: 팔꿈치 먼-드럼 이동 요구치(~7.5)+PD여유 커버, 실기 velocity_limit(46) 아래. 기존 π는 gross 이동 병목 → high/hihat reach-miss 원인 [[joint-limits-corrected]]
+    # 배정 히스테리시스: h0 담당팔을 바꾸려면 상대 팔 점수가 이 비율만큼 더 좋아야 함.
+    #   배정 점수(travel/w)는 스케일이 60배 차이나서 절대 마진은 부적합 → 상대(비율) 마진.
+    #   경계 채터링(초당 2.8회 뒤집힘 → idle 팔 헛스윙)만 차단, 재장전 BIG(1e3) 교대는 그대로 통과.
+    sched_hysteresis: float = 0.25
+
+    # 교차 배정 페널티 [배율]. 왼팔이 우측(x>0) 드럼 / 오른팔이 좌측(x<0) 드럼을 맡을 때
+    #   '반대편 침범량[m] × 이 값'을 추가 이동거리로 과금.
+    #   필요성: arm_score가 현재 팁 위치(travel)만 봐서, 한 번 교차하면 "이미 거기 있으니 travel=0" →
+    #   교차가 항상 이기는 자기강화 고리가 생김. 교차량은 드럼 x·팔 정체성만으로 결정되어 이 고리를 끊음.
+    #   1.5 근거: 3.0은 과도 — 각 팔이 자기 쪽 전체를 혼자 스윕하게 되어 어깨 방위축 과회전·오버슈트
+    #   (miss3_dir 0.249→0.445, wrong_rate 0.037→0.074, shoulder_ang_vel +43%)를 유발. 충돌은 이미
+    #   stick_contact 0.080→0.006으로 해결됐고, fresh 학습은 교차를 '깨는' 게 아니라 '예방'이라 1.5로 충분.
+    #   재장전 중인 팔의 BIG(1e3)은 여전히 압도 → 연타 교대는 그대로 유지됨.
+    sched_cross_penalty: float = 1.5
+
+    action_scale: float = 10.0         # 기본 관절 지령 각속도 상한 [rad/s]. π→10: 팔꿈치 먼-드럼 이동 요구치(~7.5)+PD여유 커버, 실기 velocity_limit(46) 아래. 기존 π는 gross 이동 병목 → high/hihat reach-miss 원인 [[joint-limits-corrected]]
     wrist_action_scale: float = 25.0      # 손목만 상한 크게 (빠른 패시지 ~24 rad/s 커버)
 
     # 관측값 정규화

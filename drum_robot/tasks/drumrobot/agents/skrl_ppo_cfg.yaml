@@ -28,7 +28,10 @@ agent:
   rollouts: 64 #64
   learning_epochs: 4
   mini_batches: 4 #4
-  discount_factor: 0.99
+  # 유효 지평 = 1/(1-gamma) 스텝. 시간으로 보존해야 하므로 제어주기를 바꾸면 같이 바꿀 것.
+  #   66.667Hz: 0.991 → 111스텝 × 0.015s = 1.67초  (60Hz 의 0.99 = 100스텝 × 1/60 과 동일)
+  #   환산식: new_gamma = old_gamma ^ (old_hz / new_hz).  0.99^(60/66.667) = 0.991
+  discount_factor: 0.991
   lambda: 0.95
   learning_rate: 1.0e-04
   learning_rate_scheduler: KLAdaptiveLR
@@ -58,5 +61,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 500000 #1000000
+  timesteps: 1000000 #1000000
   environment_info: log

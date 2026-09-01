@@ -168,7 +168,7 @@ def compute_arm_target_assignment(
     # ready-pose: case 1의 노는 팔을 "드럼 위 ready_height"에 3D로 고정.
     #   기준점은 스케줄러 배정 하나만 사용 (팔꿈치 거리 휴리스틱 폐기 — 재장전 교대를 몰라서 스케줄러와 어긋났음).
     #   배정 없음(=lookahead 2초 안에 자기 노트 없음, 상대팔 연타 구간) → 마지막으로 친 드럼 위에서 대기.
-    #   ⚠️ 폴백은 반드시 '움직이지 않는' 기준이어야 함. h0/h1로 폴백하면 음표마다 기준이 떠서
+    #   폴백은 반드시 '움직이지 않는' 기준이어야 함. h0/h1로 폴백하면 음표마다 기준이 떠서
     #      노는 팔이 치는 팔과 동기해 위아래로 스윙함 (관측된 버그).
     idle_tip = torch.where(use_left.unsqueeze(-1), right_tip_pos, left_tip_pos)          # (N,3)
     sched_p  = torch.where(use_left.unsqueeze(-1), idle_tgt_pos[:, 1], idle_tgt_pos[:, 0])   # (N,3)
@@ -495,7 +495,7 @@ class RewardComputerCfg:
     #   ±aim_offset이면 두 선분의 x구간이 2·aim_offset 벌어져 관통이 기하학적으로 불가.
     #   hit_detector는 드럼 중심 기준 그대로(인정 반경 0.13) → 4cm는 그 31%라 성공률 영향 없음.
     #   부수 이득: 오프셋이 항상 자기 어깨 쪽이라 크로스 배정 시 도달거리가 aim_offset 만큼 줄어듦.
-    #   ⚠️ mid↔ride 간격이 0.120m(off_target 반경 0.13 안쪽)라 그 쌍은 부담이 약간 늘 수 있음 → 성적 하락 시 0.03으로
+    #   mid↔ride 간격이 0.120m(off_target 반경 0.13 안쪽)라 그 쌍은 부담이 약간 늘 수 있음 → 성적 하락 시 0.03으로
     aim_offset: float = 0.04
 
     # 대기점 긴급도 가중 + 휴식 x 제한 — 쉬는 팔이 반대편으로 '미리, 오래' 건너가는 것 차단.
@@ -612,7 +612,7 @@ class RewardComputerCfg:
     stick_contact_threshold: float = 0.025  # 진짜 접촉 스케일 [m] = 스틱 두께
 
     # 접근 밴드 — 접촉 '전에' 밀어내는 항. 위 접촉항은 2.5cm 밖에서 gradient가 0이라 접근을 못 막음.
-    #   ⚠️ 과거 5cm 근접 페널티가 X자를 만든 건 '정상 타격의 필연적 근접'을 벌했기 때문.
+    #    과거 5cm 근접 페널티가 X자를 만든 건 '정상 타격의 필연적 근접'을 벌했기 때문.
     #      지금은 stick_close_hit = 0.000 (타격 시 2.5cm 이내 0회)이고, 아래 strike_phase 게이트로
     #      하강 구간 전체를 면제하므로 그 메커니즘이 구조적으로 발생할 수 없음.
     stick_gap_range: float = 0.08     # 이 거리부터 선형 증가 [m]. 실측 hit_stick_dist=0.452 라 여유 5.6배

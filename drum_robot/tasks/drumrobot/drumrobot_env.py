@@ -119,6 +119,15 @@ class DrumRobotEnv(DirectRLEnv):
             scale_list, device=self.device, dtype=torch.float32
         ).unsqueeze(0)  # (1, 9)
 
+        # 제어 지연 버퍼 (물리 스텝 단위, 순환 인덱스). 0이면 미사용 — 기존 동작과 완전히 동일.
+        #   _apply_action 이 물리 스텝마다 호출되므로 여기서 밀면 1/120초 해상도가 나옴.
+        self.delay_steps = int(self.cfg.action_delay_steps)
+        self.target_buf = torch.zeros(
+            (self.delay_steps + 1, self.num_envs, len(ctrl_joint_names)),
+            device=self.device, dtype=torch.float32,
+        )
+        self._delay_ptr = 0
+
         # 관절 한계-초과 로그용 짧은 이름 (ctrl 순서). lim/<이름> 으로 출력됨
         _short = {
             "waist_joint": "waist",
@@ -168,6 +177,7 @@ class DrumRobotEnv(DirectRLEnv):
             device=self.device,
             cfg=rds_cfg,
             env=env_specs,
+            
         )
 
         # 타격 감지
@@ -375,7 +385,15 @@ class DrumRobotEnv(DirectRLEnv):
 
     def _apply_action(self):
         ctrl_joint_ids = self.robot_interface.get_ctrl_joint_ids()
-        self.robot.set_joint_position_target(self.target_joint_pos, joint_ids=ctrl_joint_ids)
+        if self.delay_steps > 0:
+            # 순환 버퍼에 지금 목표를 넣고, D 스텝 전 목표를 꺼내 적용 (순수 정수 지연)
+            n = self.delay_steps + 1
+            self._delay_ptr = (self._delay_ptr + 1) % n
+            self.target_buf[self._delay_ptr] = self.target_joint_pos
+            target = self.target_buf[(self._delay_ptr - self.delay_steps) % n]
+        else:
+            target = self.target_joint_pos
+        self.robot.set_joint_position_target(target, joint_ids=ctrl_joint_ids)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # 전역 스텝 (MIDI 커리큘럼 램프)
@@ -640,6 +658,10 @@ class DrumRobotEnv(DirectRLEnv):
         joint_pos, joint_vel = self.robot_interface.reset(robot=self.robot, env_ids=env_ids, init_robot_pos=init_robot_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
+        # 지연 버퍼도 리셋 자세로 채움 — 안 하면 새 에피소드 첫 스텝에 '이전 에피소드 목표'가 적용됨
+        if self.delay_steps > 0:
+            self.target_buf[:, env_ids, :] = joint_pos[:, self.robot_interface.get_ctrl_joint_ids()]
+
         # tip 리셋
         tip_pos = self.robot_interface.get_body_pos(self.robot)
         self.hit_detector.reset(env_ids=env_ids, tip_pos=tip_pos)
@@ -724,8 +746,15 @@ class DrumRobotEnv(DirectRLEnv):
         self.joint_vel_scale = torch.tensor(self.cfg.joint_vel_scale, device=self.device, dtype=torch.float32)
 
         # drum
-        drum_min = self.default_drum_pos.min(dim=0).values
-        drum_max = self.default_drum_pos.max(dim=0).values
+        # ⚠️ 프레임 정합 (2026-08-31 수정): default_drum_pos 는 허리 기준이지만, obs 에 실제로 들어가는
+        #   drum_pos / tip_pos 는 env 프레임(_reset_drum 에서 z 에 robot_waist_joint_offset_z 를 더함)이다.
+        #   상수를 허리 기준으로 만들면 z 분자가 half_range 의 ~5배가 되어 8개 드럼이 전부 clamp(+1.5)에 포화됐다.
+        #   그 결과 z 채널 14개(tip 2 + drum 8 + per_arm 4)가 상수가 되어 정책이 높이를 관측하지 못했고,
+        #   드럼 위치 DR(±2cm)의 z 성분도 clamp 에 묻혀 버려졌다. → 상수를 값과 같은 프레임으로 올린다.
+        drum_min = self.default_drum_pos.min(dim=0).values.clone()
+        drum_max = self.default_drum_pos.max(dim=0).values.clone()
+        drum_min[2] = drum_min[2] + self.cfg.robot_waist_joint_offset_z
+        drum_max[2] = drum_max[2] + self.cfg.robot_waist_joint_offset_z
 
         center = 0.5 * (drum_min + drum_max)
         half_range = 0.5 * (drum_max - drum_min) + 1e-6

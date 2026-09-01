@@ -1,0 +1,182 @@
+{
+  "_comment": "export_policy.py 가 생성. 손으로 고치지 말 것 — 재export 하면 덮어씀.",
+  "checkpoint": "logs/skrl/drum_robot/2026-08-31_09-55-09_ppo_torch_drum_robot/checkpoints/best_agent.pt",
+  "run": "2026-08-31_09-55-09_ppo_torch_drum_robot",
+  "source_drift_after_run": [
+    "drumrobot_cfg.py"
+  ],
+  "obs_dim": 148,
+  "act_dim": 9,
+  "opset": 13,
+  "graph_input_names": [
+    "joint_pos",
+    "joint_vel",
+    "tip_pos",
+    "drum_pos",
+    "next_hits",
+    "hit_armed",
+    "arm_role",
+    "per_arm_pos",
+    "per_arm_time"
+  ],
+  "graph_output_names": [
+    "action_mean"
+  ],
+  "graph_does_normalization": true,
+  "position_frame": "waist_relative_meters",
+  "joint_order": [
+    "waist_joint",
+    "left_shoulder_1",
+    "right_shoulder_1",
+    "left_shoulder_2",
+    "right_shoulder_2",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "joint_order_source": "articulation BFS 추정 (dump_golden.py 가 검증)",
+  "motor_id_by_obs_index": [
+    0,
+    2,
+    1,
+    5,
+    3,
+    6,
+    4,
+    8,
+    7
+  ],
+  "joint_name_to_motor_id": {
+    "waist_joint": 0,
+    "left_shoulder_1": 2,
+    "right_shoulder_1": 1,
+    "left_shoulder_2": 5,
+    "right_shoulder_2": 3,
+    "left_elbow": 6,
+    "right_elbow": 4,
+    "left_wrist": 8,
+    "right_wrist": 7
+  },
+  "drum_names": [
+    "snare",
+    "floor",
+    "mid",
+    "high",
+    "hihat",
+    "ride",
+    "crash_r",
+    "crash_l"
+  ],
+  "drum_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "real_to_sim_drum": {
+    "method": "midpoint(real.right.position, real.left.position) - (0, 0, z_shift)",
+    "z_shift": 0.045,
+    "verified_max_xy_error_m": 0.0005,
+    "note": "z 오차는 정규화 clamp(+-1.5)에 흡수된다. XY 는 흡수되지 않는다."
+  },
+  "policy_tick_stride": 3,
+  "policy_dt": 0.015,
+  "train_step_dt": 0.016666666667,
+  "sim_dt": 0.008333333333,
+  "decimation": 2,
+  "actuator_gains": {
+    "waist": {
+      "stiffness": 100.0,
+      "damping": 5.0
+    },
+    "arm": {
+      "stiffness": 100.0,
+      "damping": 5.0
+    },
+    "wrist": {
+      "stiffness": 2.1,
+      "damping": 0.035
+    }
+  },
+  "action_delay_steps": 0,
+  "action_scale": 10.0,
+  "wrist_action_scale": 25.0,
+  "hit_detector": {
+    "drum_xy_radius": 0.13,
+    "drum_z_range": 0.07,
+    "min_impact_velocity": 0.2,
+    "rearm_height": 0.18,
+    "tip_vel_filter_alpha": 0.6,
+    "hit_window_step": 3,
+    "hit_window_s": 0.05,
+    "rearm_s": 0.116667
+  },
+  "max_lookahead_s": 2.0,
+  "max_lookahead_step": 120,
+  "time_norm_denom_s": 1.983333333333,
+  "sched_notes": 2,
+  "num_hits": 6,
+  "_normalization_in_graph": {
+    "note": "C++ 은 정규화하지 않는다. 아래는 참고·검증용.",
+    "joint_center": [
+      0.043633282,
+      1.745329261,
+      1.265363693,
+      0.261799365,
+      0.261799365,
+      1.313360214,
+      1.313360214,
+      0.383972406,
+      0.383972406
+    ],
+    "joint_half_range": [
+      1.527163982,
+      1.308997989,
+      1.265364647,
+      1.221731424,
+      1.221731424,
+      1.051561832,
+      1.051561832,
+      0.820305765,
+      0.820305765
+    ],
+    "joint_vel_scale": 5.0,
+    "drum_center_raw": [
+      0.096500009,
+      0.513999999,
+      -0.315500021
+    ],
+    "drum_center_eff": [
+      0.096500009,
+      0.513999999,
+      -1.315500021
+    ],
+    "drum_half_range": [
+      0.388501018,
+      0.155001014,
+      0.169501007
+    ],
+    "z_offset_folded": 1.0,
+    "degenerate_channels": [
+      20,
+      23,
+      26,
+      29,
+      32,
+      35,
+      38,
+      41,
+      44,
+      47,
+      134,
+      138,
+      142,
+      146
+    ]
+  }
+}

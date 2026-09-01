@@ -18,6 +18,14 @@ class HitDetectorCfg:
     drum_z_range: float = 0.07
     min_impact_velocity: float = 0.2
     rearm_height: float = 0.18
+    # ★ 스텝 단위이므로 제어주기를 바꾸면 반드시 같이 바꿔야 한다 (초로 자동 변환되지 않음).
+    #   두 가지 역할을 한다: ①타격 판정 창 ±W  ②악보 생성 최소 간격 min_gap = 2W+1
+    #   ②가 더 중요: min_gap 미만으로 붙은 같은드럼 연타는 rearm_height(0.18m) 리프트가 시간 안에
+    #   불가능해 "절대 못 치는 타겟"이 되므로, 생성기가 그런 클러스터를 드롭한다. W가 작으면 그 보호가
+    #   풀려서 연주 불가능한 노트가 학습 데이터에 섞인다. [[midi-mixing-and-density]]
+    #   현재 60Hz 기준: 3 스텝 = 판정 창 ±50ms, min_gap = 7 스텝 = 116.7ms
+    #   주기를 바꿀 때 환산: 같은 ms 를 유지하는 정수로. 예) 100Hz 면 5 (창 ±50ms, min_gap 110ms)
+    #     (100Hz 에서 3 을 그대로 두면 창 30ms, min_gap 70ms → 재장전 불가한 연타가 악보에 섞인다)
     hit_window_step: int = 3
 
 class HitDetector:

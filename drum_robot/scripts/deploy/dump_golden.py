@@ -127,7 +127,13 @@ def main(env_cfg, agent_cfg):
             "drum_pos": (1, 8, 3), "next_hits": (1, 6, 11), "hit_armed": (1, 2, 8),
             "arm_role": (1, 2), "per_arm_pos": (1, 2, 2, 3), "per_arm_time": (1, 2, 2),
         }
+        # ★ 프레임 변환. 그래프는 실기와 같은 "허리 기준"을 먹는다.
+        #   raw 는 env 프레임이므로 위치 3종의 z 에서 z_offset 을 뺀다.
+        #   이걸 빠뜨리면 정규화가 1.0 만큼 어긋나 z 채널이 clamp 에 포화된다.
         feed = {k: np.asarray(raw[k], dtype=np.float32).reshape(shapes[k]) for k in IN_NAMES}
+        for k in ("tip_pos", "drum_pos", "per_arm_pos"):
+            feed[k] = feed[k].copy()
+            feed[k][..., 2] -= z_off
         act = sess.run(["action_mean"], feed)[0].reshape(-1)
 
         # ---- C++ 이 먹일 입력: 모터 id 순서 ----

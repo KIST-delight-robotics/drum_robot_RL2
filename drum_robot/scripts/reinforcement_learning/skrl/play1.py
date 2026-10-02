@@ -65,6 +65,12 @@ parser.add_argument(
 parser.add_argument("--midi_file", type=str, default=None, help="레벨 2/3 에서 평가할 MIDI 파일 경로")
 parser.add_argument("--slow_factor", type=float, default=None, help="RDS slow_factor override (기본 1.5=학습값, 1.0=원곡 템포)")
 parser.add_argument("--export_traj", type=str, default=None, help="env0 관절 궤적을 CSV로 저장(한 에피소드). MATLAB 확인용. --num_envs=1 권장")
+parser.add_argument("--telemetry", type=str, default=None,
+                    help="정책 명령을 UDP 송신 (HOST:PORT 또는 PORT). scripts/analysis/scope.py 로 실시간 관찰. "
+                         "sim 비용 ~50us/스텝 (15ms 예산의 0.3%)")
+parser.add_argument("--wrist_fd", action="store_true", default=False,
+                    help="[sim2real 점검] 손목 속도 obs 를 실기와 같은 유한차분으로 대체. "
+                         "같은 체크포인트로 켜고/끄고 두 번 돌린 성공률 차이 = 이 채널의 배포 갭")
 parser.add_argument("--random_drums", action="store_true", default=False,
                     help="드럼 위치 랜덤화(DR) 유지. 기본(play1)은 실기 위치로 고정(drum_noise_scale=0)")
 parser.add_argument("--log_every", type=int, default=300,
@@ -138,7 +144,16 @@ else:
 
 
 def _midi_span_seconds(path: str):
-    """MIDI 파일의 (첫 노트 시각, 마지막 노트 시각)[초] — 레벨3 에피소드 길이 계산용 (채널 9만)."""
+    """악보 파일의 (첫 노트 시각, 마지막 노트 시각)[초] — 레벨3 에피소드 길이 계산용.
+    .txt(실기 서버 형식)는 RDS 의 텍스트 로더로, .mid 는 MIDI 채널 9 노트로 계산."""
+    if path.lower().endswith(".txt"):
+        from drum_robot.tasks.drumrobot.components.robotic_drum_score import read_rds_txt
+        _, events = read_rds_txt(path)
+        arm_t = [t for t, name, _ in events if name != "Bass Drum 1"]
+        if not arm_t:
+            raise ValueError(f"텍스트 악보에 팔 타격이 없습니다: {path}")
+        # .txt 는 절대 시각 유지(RDS _build_full_song 과 동일) → 앞 침묵까지 에피소드에 포함
+        return 0.0, max(arm_t)
     from mido import MidiFile   # pyright: ignore[reportMissingImports]
     mid = MidiFile(path)
     tpb = mid.ticks_per_beat
@@ -202,6 +217,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     # ===== play1 평가 설정: 실제 MIDI 강제 =====
     env_cfg.eval_midi_ratio = 1.0   # 세 모드 모두 순수 MIDI (랜덤 0%)
+    env_cfg.wrist_vel_finite_diff = args_cli.wrist_fd   # [sim2real 점검] 손목 속도 유한차분 A/B
     if args_cli.slow_factor is not None:
         env_cfg.eval_slow_factor = args_cli.slow_factor   # 원곡 템포 테스트용 override (1.0 등)
 
@@ -234,7 +250,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
 
     print(
         f"[PLAY1] eval_mode={args_cli.eval_mode} | midi_ratio={env_cfg.eval_midi_ratio} | "
-        f"file={env_cfg.eval_midi_file or '(all)'} | full_song={env_cfg.eval_full_song} | slow_factor={env_cfg.eval_slow_factor}"
+        f"file={env_cfg.eval_midi_file or '(all)'} | full_song={env_cfg.eval_full_song} | slow_factor={env_cfg.eval_slow_factor}\n"
+        f"[PLAY1] wrist_vel = {'유한차분(실기 모사)' if env_cfg.wrist_vel_finite_diff else '참값(학습 그대로)'}"
     )
 
     # configure the ML framework into the global skrl variable
@@ -343,6 +360,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         print(f"[EXPORT] env0 궤적 기록 → {args_cli.export_traj} "
               f"(phill trajectory_log 양식: t,joint 0..{NUM_REAL_JOINT-1})")
 
+    # ===== 정책 명령 UDP 텔레메트리 (scripts/analysis/scope.py 가 수신) =====
+    #   sim 은 sendto 만 하고 그림은 별 프로세스가 그린다 → sim 루프 영향 사실상 0.
+    #   패킷 포맷은 scope.py 와 공유 (아래 두 Struct). 헤더는 1초마다 재전송 →
+    #   뷰어를 언제 켜도/재시작해도 관절이름·한계를 자동으로 받는다.
+    tel = None
+    if args_cli.telemetry is not None:
+        import socket, struct
+        _h, _, _p = args_cli.telemetry.rpartition(":")
+        _addr = (_h or "127.0.0.1", int(_p))
+        _b = env.unwrapped
+        _names = _b.robot_interface.get_ctrl_joint_name()          # articulation 해석 순서 (specs 순서와 다름!)
+        _lo, _hi = _b.robot_interface.get_limit()                  # (1,9) robot 프레임 [rad]
+        _eff = _b.robot.data.joint_effort_limits[0, _b.robot_interface.get_ctrl_joint_ids()]   # (9,) N·m
+        tel = dict(
+            sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+            addr=_addr,
+            hdr=struct.Struct("<4sI9f9f9f144s"),                   # magic, njoint, lo, hi, effort, names(9×16B)
+            dat=struct.Struct("<4sIf36f"),                         # magic, seq, t, action9, target9, q9, tau9
+            seq=0,
+            scale=_b.action_scale_vec[0],
+            dt=float(_b.step_dt),
+            lo=_lo[0], hi=_hi[0],
+            hdr_bytes=None,
+        )
+        tel["hdr_bytes"] = tel["hdr"].pack(
+            b"DRM0", len(_names),
+            *_lo[0].cpu().tolist(), *_hi[0].cpu().tolist(), *_eff.cpu().tolist(),
+            b"".join(n.encode()[:16].ljust(16, b"\0") for n in _names),
+        )
+        print(f"[TEL] 정책 명령 UDP → {_addr[0]}:{_addr[1]}")
+        print(f"[TEL] 뷰어:  python drum_robot/scripts/analysis/scope.py --port {_addr[1]}")
+        print(f"[TEL] 관절 순서: {_names}")
+        print(f"[TEL] effort_limit [N·m]: {[round(v, 2) for v in _eff.cpu().tolist()]}")
+
     # ===== play1은 드럼 위치를 실기(drum_coordinate.json) 위치로 고정 =====
     #   학습은 드럼 DR(랜덤화)하지만, 평가/CSV export는 실기 layout으로 고정해야 재생과 일치.
     #   nominal(specs.py Instruments) = 실기 R/L 중점(z-0.045)이라, drum_noise_scale=0 이면 실기 위치.
@@ -370,8 +421,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
             # - single-agent (deterministic) actions
             else:
                 actions = outputs[-1].get("mean_actions", outputs[0])
+            # 텔레메트리: 정책이 실제로 본 관절각 (_pre_physics_step 과 같은 시점)
+            _q_pre = None
+            if tel is not None:
+                _rb = env.unwrapped
+                _q_pre = _rb.robot_interface.get_joint_pos(_rb.robot)[0].clone()
+
             # env stepping
             obs, _, terminated, truncated, _ = env.step(actions)
+
+            # 텔레메트리 송신 — env._pre_physics_step 과 똑같은 식으로 명령을 재현
+            if tel is not None:
+                _rb = env.unwrapped
+                _a = torch.clamp(actions[0], -1.0, 1.0)
+                _tgt = torch.clamp(_q_pre + _a * tel["scale"] * tel["dt"], tel["lo"], tel["hi"])
+                _q = _rb.robot_interface.get_joint_pos(_rb.robot)[0]
+                _tau = _rb.robot_interface.get_joint_torque(_rb.robot)[0]
+                _v = torch.cat([_a, _tgt, _q, _tau]).cpu().tolist()   # D2H 1회 (36 float)
+                if tel["seq"] % 66 == 0:                            # 약 1초마다 헤더 재전송
+                    tel["sock"].sendto(tel["hdr_bytes"], tel["addr"])
+                tel["sock"].sendto(
+                    tel["dat"].pack(b"DRM1", tel["seq"], tel["seq"] * tel["dt"], *_v), tel["addr"])
+                tel["seq"] += 1
 
         # ===== env0 관절각 기록 (실기 trajectory_log 양식: 13관절, 실기 id 순서, 관절각 rad) =====
         if export_base is not None:

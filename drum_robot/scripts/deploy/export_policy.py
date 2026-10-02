@@ -3,16 +3,12 @@
 
     policy.onnx         env 정규화 + 스케일러 + MLP + 결정적 평균 (한 그래프)
     obs_constants.json  obs_builder 가 조립 로직을 짜는 데 필요한 상수
-
-설계 근거: Phil ONNX 런타임 전환 명세
-  https://claude.ai/code/artifact/d3d6b309-3e48-4ca5-93bb-ebdd3c2c0c07
-
 핵심 두 가지
   1) 정규화를 C++ 이 아니라 그래프 안에서 한다.
      그래프 입력은 원시 물리량 9개 버퍼이고, 위치는 전부 "허리 기준 미터".
      -> eps 관례, clamp 값, 148개 인덱스 순서를 C++ 이 재현할 필요가 없어진다.
 
-  2) drum_center 에 z 오프셋을 미리 접는다.
+  2) drum_center 는 허리 기준 그대로 쓴다 (z 오프셋은 정규화에서 상쇄된다).
      sim 은 런타임 drum_pos/tip_pos 를 월드 프레임(+robot_waist_joint_offset_z)에서
      정규화하는데, 정규화 상수는 오프셋 없는 배열에서 만들어졌다(env.py:817 vs 748).
      그 결과 z 14채널이 clamp(+-1.5)에 상시 포화해 스케일러가 상수로 학습했다
@@ -197,11 +193,20 @@ def build_constants(joint_order: list[str], run: dict) -> dict:
     drum_center = 0.5 * (drum_min + drum_max)
     drum_half_range = 0.5 * (drum_max - drum_min) + 1e-6                                 # env.py:751-752
 
-    # ---- z 오프셋을 center 에 접는다 (명세 04절) ----
-    # 런이 기록한 값을 쓴다 — 라이브 소스가 학습 후 바뀔 수 있다.
+    # ---- z 오프셋: 접지 않는다 ★2026-09-02 수정 ----
+    #
+    # 이전에 drum_center_eff[2] -= z_off 를 했고, 그것이 z 채널 14개를 전부
+    # clamp(+1.5) 에 포화시켜 정책이 높이를 관측하지 못하게 만들었다.
+    #
+    # 올바른 관계:
+    #   env  : (env값 − env중심),  env중심 = 허리중심 + z_off   (drumrobot_env.py:798-801)
+    #   실기 : (허리값 − 허리중심)
+    #   env값 = 허리값 + z_off 이므로 두 식은 항등이다. z_off 가 상쇄된다.
+    #
+    # 따라서 실기(허리 기준 입력)용 상수는 drum_center 그대로다.
+    # inst.position 이 이미 허리 기준이므로 아무것도 더하거나 빼지 않는다.
     z_off = float(run["robot_waist_joint_offset_z"])
-    drum_center_eff = drum_center.clone()
-    drum_center_eff[2] -= z_off
+    drum_center_eff = drum_center.clone()   # = 허리 기준. 이름은 하위호환으로 유지
 
     # ---- 나머지 상수는 런이 기록한 값에서 (라이브 소스가 아니라) ----
     joint_vel_scale = float(run["joint_vel_scale"])
@@ -227,7 +232,10 @@ def build_constants(joint_order: list[str], run: dict) -> dict:
     max_lookahead_step = int(max_lookahead_s / train_step_dt)
 
     return dict(
-        action_delay_steps=int(run.get("action_delay_steps", 0)),
+        # 학습 지연은 이제 범위 DR — 배포 메타에는 [min, max] 를 둘 다 싣는다.
+        #   구 런(env.yaml 에 action_delay_steps 단일 키)도 읽히도록 폴백.
+        action_delay_steps_min=int(run.get("action_delay_steps_min", run.get("action_delay_steps", 0))),
+        action_delay_steps_max=int(run.get("action_delay_steps_max", run.get("action_delay_steps", 0))),
         joint_order=joint_order,
         joint_name_to_motor_id={n: int(robot_spec.joint_name_to_ik_result_idx[n]) for n in joint_order},
         motor_id_by_obs_index=[int(robot_spec.joint_name_to_ik_result_idx[n]) for n in joint_order],
@@ -476,11 +484,45 @@ def main() -> int:
             print(f"         학습이 모델링한 법칙과 실기가 실행하는 법칙이 다릅니다. 중단합니다.")
             return 2
 
-    # 포화 채널 진단 — 왜 z 오프셋을 접어야 하는지 눈으로 확인
+    # ---- 2c. 정규화 포화 가드 ★2026-09-02 추가 ----
+    #
+    # 왜 필요한가: 2026-09-02 에 drum_center 의 z 오프셋 부호를 잘못 넣어
+    # z 채널 14개(tip 2 + drum 8 + per_arm 4)가 전부 clamp(±1.5)에 붙었다.
+    # 정책이 높이를 관측하지 못해 타격이 0회가 됐는데, 원시버퍼 대조와
+    # PyTorch-vs-ORT 검증은 둘 다 통과했다 — 같은 상수를 쓰기 때문이다.
+    #
+    # 이 가드는 "이 상수로 실제 드럼 좌표를 정규화하면 범위 안에 들어오는가"를
+    # 직접 본다. 상수가 프레임을 잘못 잡으면 즉시 드러난다.
+    # 드럼 좌표의 극값을 center/half_range 에서 복원한다 (build_constants 가 그렇게 만들었다).
+    dc  = c["drum_center"]           # 허리 기준
+    dhr = c["drum_half_range"]
+    dce = c["drum_center_eff"]       # 그래프가 실제로 쓰는 상수
+    drum_wr = torch.stack([dc - (dhr - 1e-6), dc + (dhr - 1e-6)])   # (2,3) min/max
+    dn = (drum_wr - dce) / dhr
+    sat = (dn.abs() > 1.5)
+    n_sat = int(sat.sum())
+    print(f"      정규화 포화 가드: 드럼 극값 2점 x 3축 중 포화 {n_sat}개")
+    if n_sat > 0:
+        worst = dn.abs().max().item()
+        ax = ["x", "y", "z"]
+        per_ax = {ax[i]: int(sat[:, i].sum()) for i in range(3)}
+        print(f"\n      !! 정규화 상수가 드럼 좌표를 clamp(±1.5) 밖으로 보냅니다.")
+        print(f"         축별 포화: {per_ax}   최대 |정규화값| = {worst:.2f}")
+        print(f"         drum_center_eff = {[round(v, 4) for v in dce.tolist()]}")
+        print(f"         drum_half_range = {[round(v, 4) for v in dhr.tolist()]}")
+        print(f"         드럼 좌표 범위   = {[round(v, 4) for v in drum_wr[0].tolist()]}"
+              f" ~ {[round(v, 4) for v in drum_wr[1].tolist()]}")
+        print(f"\n         이 상태로 배포하면 해당 축이 상수가 되어 정책이 그 축을")
+        print(f"         관측하지 못합니다. 프레임(허리 기준 vs env)을 확인하세요.")
+        print(f"         drumrobot_env.py 의 drum_center 계산과 같은 프레임이어야 합니다.")
+        print(f"         중단합니다.")
+        return 3
+
+    # 스케일러 std 진단 (학습 중 상수였던 채널)
     std = scaler_var.sqrt()
     degenerate = (std < 1e-3).nonzero().flatten().tolist()
     print(f"      스케일러 std < 1e-3 채널 {len(degenerate)}개: {degenerate}")
-    print(f"      -> 이 채널들은 학습 중 상수였다. drum_center_eff 가 이를 재현한다.")
+    print(f"      -> 이 채널들은 학습 중 상수였다.")
 
     # ---- 3. 그래프 ----
     model = DeployPolicy(net, c, scaler_mean, scaler_var).eval()
@@ -565,7 +607,8 @@ def main() -> int:
         "sim_dt": round(c["sim_dt"], 12),
         "decimation": c["decimation"],
         "actuator_gains": c["gains"],
-        "action_delay_steps": c["action_delay_steps"],
+        "action_delay_steps_min": c["action_delay_steps_min"],
+        "action_delay_steps_max": c["action_delay_steps_max"],
         "action_scale": c["action_scale"],
         "wrist_action_scale": c["wrist_action_scale"],
 

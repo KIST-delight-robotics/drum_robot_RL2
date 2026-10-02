@@ -17,15 +17,10 @@ class HitDetectorCfg:
     drum_xy_radius: float = 0.13
     drum_z_range: float = 0.07
     min_impact_velocity: float = 0.2
-    rearm_height: float = 0.18
-    # ★ 스텝 단위이므로 제어주기를 바꾸면 반드시 같이 바꿔야 한다 (초로 자동 변환되지 않음).
-    #   두 가지 역할을 한다: ①타격 판정 창 ±W  ②악보 생성 최소 간격 min_gap = 2W+1
-    #   ②가 더 중요: min_gap 미만으로 붙은 같은드럼 연타는 rearm_height(0.18m) 리프트가 시간 안에
-    #   불가능해 "절대 못 치는 타겟"이 되므로, 생성기가 그런 클러스터를 드롭한다. W가 작으면 그 보호가
-    #   풀려서 연주 불가능한 노트가 학습 데이터에 섞인다. [[midi-mixing-and-density]]
-    #   현재 60Hz 기준: 3 스텝 = 판정 창 ±50ms, min_gap = 7 스텝 = 116.7ms
-    #   주기를 바꿀 때 환산: 같은 ms 를 유지하는 정수로. 예) 100Hz 면 5 (창 ±50ms, min_gap 110ms)
-    #     (100Hz 에서 3 을 그대로 두면 창 30ms, min_gap 70ms → 재장전 불가한 연타가 악보에 섞인다)
+    # 재장전(rearm) 문턱 [m]. diff_z = tip_z - drum_z 기준이라 드럼마다 절대 높이는 다르다 (밴드 상한 0.07 + 마진 0.03)
+    rearm_height: float = 0.10
+
+    # 스텝 단위이므로 제어주기를 바꾸면 같이 바꿔야 한다 (초로 자동 변환되지 않음)
     hit_window_step: int = 3
 
 class HitDetector:
@@ -78,6 +73,26 @@ class HitDetector:
         # 양팔 중 하나라도 해당 drum을 strike하면 hit
         hit_mask = torch.any(hit_per_arm, dim=1)   # (N, M)
 
+        # [진단] miss3_dir 원인 4분할 — "기하는 충족했는데 어느 게이트에 막혔나"
+        _geo = in_xy_range & in_z_range                                  # (N,2,M) 기하 충족 (중재 전)
+        _vz = tip_vel[:, :, 2].unsqueeze(-1)                             # (N,2,1)
+        _going = _vz < 0.0                                               # 하강 방향
+        _enough = _vz < (-self.cfg.min_impact_velocity)                  # 0.2 m/s 이상
+        _armed = self.hit_armed                                          # 이번 판정에 쓰인 값
+        self._st_armed = (_geo & ~_armed).any(dim=1)                                   # (N,M) 재장전 안 됨
+        self._st_down  = (_geo &  _armed & ~_going).any(dim=1)                         # 상승 중 통과
+        self._st_slow  = (_geo &  _armed &  _going & ~_enough).any(dim=1)              # 하강인데 느림
+        self._st_arb   = (_geo &  _armed &  _enough & ~contact_mask).any(dim=1)        # 최근접 중재에 밀림
+
+        # [진단] reach/zpos 세분화 — 이번 스텝 값 (팔 무관, 양팔 중 더 가까운 쪽)
+        _zr = self.cfg.drum_z_range
+        self._st_dxy = torch.sqrt(dist_xy_sq.clamp(min=0.0)).min(dim=1).values         # (N,M) XY 거리 [m]
+        self._st_above = (in_xy_range & (diff_z > _zr)).any(dim=1)                     # 밴드보다 위
+        self._st_below = (in_xy_range & (diff_z < 0.0)).any(dim=1)                     # 드럼면보다 아래
+        _err = torch.where(diff_z > _zr, diff_z - _zr,
+                           torch.where(diff_z < 0.0, -diff_z, torch.zeros_like(diff_z)))
+        self._st_zerr = torch.where(in_xy_range, _err, torch.full_like(_err, 1.0e3)).min(dim=1).values
+
         # re-arm 확인
         prev_hit_armed = self.hit_armed
         hit_armed = self._check_rearm(prev_hit_armed, contact_mask, diff_z)
@@ -107,7 +122,7 @@ class HitDetector:
             rds_visit_xy: torch.Tensor,
             rds_visit_xyz: torch.Tensor,
             rds_T: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, ...]:
         # 현재 ±W 윈도우 타겟
         window_target_union = self._window_target_union(rds, steps)  # (N, M)
 
@@ -119,8 +134,24 @@ class HitDetector:
         valid_hit = hit_mask & window_target_union
         self.target_done = self.target_done | valid_hit
 
+        # [진단] 원인 귀속 누적 — ★ ±W 판정 창 안에 그 드럼이 타겟일 때만 누적한다.
+        #   창 밖까지 누적하면 "직전에 그 드럼을 친 직후" 상태가 섞여 원인이 포화된다.
+        _iw = window_target_union                                        # (N,M)
+        self.blk_armed |= self._st_armed & _iw
+        self.blk_down  |= self._st_down  & _iw
+        self.blk_slow  |= self._st_slow  & _iw
+        self.blk_arb   |= self._st_arb   & _iw
+        self.near_dxy = torch.where(_iw, torch.minimum(self.near_dxy, self._st_dxy), self.near_dxy)
+        self.zp_above |= self._st_above & _iw
+        self.zp_below |= self._st_below & _iw
+        self.zp_gap = torch.where(_iw, torch.minimum(self.zp_gap, self._st_zerr), self.zp_gap)
+
         # 윈도우 끝났을 때 타격 성공 확인 (+ 성공 타격의 속도/손목각속도 + 그 타겟의 목표 velocity). 끝난 타겟은 done 해제
-        success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir = self._finalize_target_outcomes(
+        (success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity,
+         success_elbow_apex, target_T, time_error_signed, miss_reach, miss_zpos, miss_dir,
+         dir_armed, dir_down, dir_slow, dir_arb,
+         reach_near, reach_mid, reach_far,
+         zpos_above, zpos_below, zpos_both, zpos_gap) = self._finalize_target_outcomes(
             rds=rds,
             rds_visit=rds_visit,
             rds_visit_vel=rds_visit_vel,
@@ -132,8 +163,13 @@ class HitDetector:
             steps=steps,
         )
 
-        return success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, self.target_done, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir
-    
+        return (success, wrong_hit, missed_target, time_error, success_impact_vel, success_wrist_ang_vel,
+                self.target_done, target_velocity, success_elbow_apex, target_T, time_error_signed,
+                miss_reach, miss_zpos, miss_dir,
+                dir_armed, dir_down, dir_slow, dir_arb,
+                reach_near, reach_mid, reach_far,
+                zpos_above, zpos_below, zpos_both, zpos_gap)
+
     def reset(self, env_ids: torch.Tensor, tip_pos: torch.Tensor):
         # 팁 위치/속도 리셋
         self.tip_pos[env_ids] = tip_pos[env_ids]
@@ -143,6 +179,16 @@ class HitDetector:
         # 타격 상태 버퍼 리셋
         self.hit_armed[env_ids] = False # 초기 상태는 준비 안됨. 이 후 스텝에서 갱신
         self.target_done[env_ids] = False
+
+        # [진단] miss3_dir 원인 플래그 리셋
+        self.blk_armed[env_ids] = False
+        self.blk_down[env_ids] = False
+        self.blk_slow[env_ids] = False
+        self.blk_arb[env_ids] = False
+        self.near_dxy[env_ids] = 1.0e3
+        self.zp_above[env_ids] = False
+        self.zp_below[env_ids] = False
+        self.zp_gap[env_ids] = 1.0e3
 
     def get_value_for_obs(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.tip_pos, self.hit_armed
@@ -163,6 +209,32 @@ class HitDetector:
 
         # 타겟 완료 버퍼: 타겟 윈도우 안에서 유효 타격하면 True (재타 downward 억제용)
         self.target_done = torch.zeros((N, M), device=self.device, dtype=torch.bool)
+
+        # [진단] miss3_dir 원인 4분할 플래그 (N,M bool = 64KB/개). 타겟 마감 시 클리어됨
+        self.blk_armed = torch.zeros((N, M), device=self.device, dtype=torch.bool)  # 재장전 안 됨
+        self.blk_down  = torch.zeros((N, M), device=self.device, dtype=torch.bool)  # 상승 중 통과
+        self.blk_slow  = torch.zeros((N, M), device=self.device, dtype=torch.bool)  # 하강인데 느림
+        self.blk_arb   = torch.zeros((N, M), device=self.device, dtype=torch.bool)  # 최근접 중재에 밀림
+
+        # [진단] miss3_reach / miss3_zpos 세분화 — 두 조각이 전체 miss 의 3/4 인데 기전이 없었다.
+        #   near_dxy : 타겟 구간 중 팁이 그 드럼에 가장 가까웠던 XY 거리 [m]. reach miss 를
+        #              '아예 안 감(먼 거리)' vs '문턱에서 놓침(0.13 근처)' 으로 가른다.
+        #   zp_above / zp_below : XY반경 안에 있던 동안 z 가 밴드 위였나 / 아래였나.
+        #              zpos miss 의 처방이 정반대다 (못 내려옴 vs 뚫고 지나감).
+        #   zp_gap   : XY반경 안에서의 최소 |z 오차| [m]. 근접 실패인지 한참 빗나갔는지.
+        BIG = 1.0e3
+        self.near_dxy = torch.full((N, M), BIG, device=self.device, dtype=torch.float32)
+        self.zp_above = torch.zeros((N, M), device=self.device, dtype=torch.bool)
+        self.zp_below = torch.zeros((N, M), device=self.device, dtype=torch.bool)
+        self.zp_gap   = torch.full((N, M), BIG, device=self.device, dtype=torch.float32)
+
+        # detect_hit 이 매 스텝 채우는 '이번 스텝 상태'. get_result 가 창 게이팅해서 위 버퍼에 누적한다.
+        #   런타임 순서는 detect_hit → get_result 로 보장되지만, 단독 호출 시 AttributeError 방지용 초기화.
+        _z = lambda: torch.zeros((N, M), device=self.device, dtype=torch.bool)
+        self._st_armed, self._st_down, self._st_slow, self._st_arb = _z(), _z(), _z(), _z()
+        self._st_above, self._st_below = _z(), _z()
+        self._st_dxy  = torch.full((N, M), BIG, device=self.device, dtype=torch.float32)
+        self._st_zerr = torch.full((N, M), BIG, device=self.device, dtype=torch.float32)
     
     def _compute_tip_velocity(self, tip_pos: torch.Tensor, prev_tip_pos: torch.Tensor, prev_tip_vel: torch.Tensor) -> torch.Tensor:
         tip_vel = (tip_pos - prev_tip_pos) / self.env.step_dt
@@ -243,7 +315,7 @@ class HitDetector:
 
         return window_target_union
 
-    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, rds_visit_wrist: torch.Tensor, rds_visit_elbow_apex: torch.Tensor, rds_visit_xy: torch.Tensor, rds_visit_xyz: torch.Tensor, rds_T: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _finalize_target_outcomes(self, rds: torch.Tensor, rds_visit: torch.Tensor, rds_visit_vel: torch.Tensor, rds_visit_wrist: torch.Tensor, rds_visit_elbow_apex: torch.Tensor, rds_visit_xy: torch.Tensor, rds_visit_xyz: torch.Tensor, rds_T: torch.Tensor, steps: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # rds(값=velocity), rds_visit, rds_visit_vel, rds_visit_wrist, rds_visit_elbow_apex: (N, T, M)
         # steps: (N,)
 
@@ -254,6 +326,9 @@ class HitDetector:
 
         success = torch.zeros((N, M), device=self.device, dtype=torch.bool)
         time_error = torch.full((N, M), -1, device=self.device, dtype=torch.int64)
+        # [진단] 부호 있는 시간오차 [스텝]. 보상은 abs 를 쓰므로 조기/지연을 구분할 수 없었다.
+        #   offset > 0 = 타겟 시각보다 늦게 침  /  < 0 = 일찍 침.
+        time_error_signed = torch.full((N, M), -99, device=self.device, dtype=torch.int64)
         success_impact_vel = torch.zeros((N, M), device=self.device, dtype=torch.float32)
         success_wrist_ang_vel = torch.zeros((N, M), device=self.device, dtype=torch.float32)
         success_elbow_apex = torch.zeros((N, M), device=self.device, dtype=torch.float32)
@@ -298,7 +373,8 @@ class HitDetector:
 
             success |= match_mask
 
-            time_error[match_mask] = abs(offset)  # step 차이
+            time_error[match_mask] = abs(offset)  # step 차이 (보상용 — 건드리지 않음)
+            time_error_signed[match_mask] = offset  # [진단] 부호 유지
 
         missed_target = target_mask & (~success)
 
@@ -310,6 +386,37 @@ class HitDetector:
         miss_zpos = missed_target & xy_ever & (~xyz_ever)
         miss_dir = missed_target & xyz_ever
 
+        # [진단] miss_dir 원인 4분할 — detect_hit 이 누적한 게이트 플래그를 miss_dir 셀로 한정해 읽는다.
+        dir_armed = miss_dir & self.blk_armed
+        dir_down  = miss_dir & self.blk_down
+        dir_slow  = miss_dir & self.blk_slow
+        dir_arb   = miss_dir & self.blk_arb
+
+        # [진단] reach 세분화 — 최근접 XY 거리로 3분할 (판정 반경 0.13m 기준)
+        #   near : 0.13 ~ 0.20  문턱에서 놓침 → 타이밍·정밀도
+        #   mid  : 0.20 ~ 0.35  중간
+        #   far  : 0.35 이상    아예 안 감 → 능력 부족 또는 배정 문제
+        reach_near = miss_reach & (self.near_dxy < 0.20)
+        reach_mid  = miss_reach & (self.near_dxy >= 0.20) & (self.near_dxy < 0.35)
+        reach_far  = miss_reach & (self.near_dxy >= 0.35)
+
+        # [진단] zpos 세분화 — 방향(위/아래)과 근접도. 처방이 정반대라 방향이 핵심.
+        zpos_above = miss_zpos & self.zp_above & (~self.zp_below)
+        zpos_below = miss_zpos & self.zp_below & (~self.zp_above)
+        zpos_both  = miss_zpos & self.zp_above & self.zp_below
+        zpos_gap   = torch.where(miss_zpos, self.zp_gap.clamp(max=1.0), torch.zeros_like(self.zp_gap))
+
+        # 마감된 타겟의 플래그는 여기서 클리어 — 안 하면 에피소드 내내 누적돼 다음 타겟으로 샌다
+        _closing = success | missed_target
+        self.blk_armed &= ~_closing
+        self.blk_down  &= ~_closing
+        self.blk_slow  &= ~_closing
+        self.blk_arb   &= ~_closing
+        self.near_dxy = torch.where(_closing, torch.full_like(self.near_dxy, 1.0e3), self.near_dxy)
+        self.zp_above &= ~_closing
+        self.zp_below &= ~_closing
+        self.zp_gap = torch.where(_closing, torch.full_like(self.zp_gap, 1.0e3), self.zp_gap)
+
         # 마감된 타겟의 목표 velocity (성공/미스 무관, target_mask 셀만). 보상에서 목표 세기로 변환
         target_velocity = torch.where(target_mask, target_vel_raw, torch.zeros_like(target_vel_raw))
 
@@ -317,7 +424,12 @@ class HitDetector:
         target_T_raw = rds_T[self.env_arange, window_end_step, :]                      # (N, M)
         target_T = torch.where(target_mask, target_T_raw, torch.zeros_like(target_T_raw))
 
-        return success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel, target_velocity, success_elbow_apex, target_T, miss_reach, miss_zpos, miss_dir
+        return (success, missed_target, time_error, success_impact_vel, success_wrist_ang_vel,
+                target_velocity, success_elbow_apex, target_T, time_error_signed,
+                miss_reach, miss_zpos, miss_dir,
+                dir_armed, dir_down, dir_slow, dir_arb,
+                reach_near, reach_mid, reach_far,
+                zpos_above, zpos_below, zpos_both, zpos_gap)
 
     def _get_hit_window_offsets(self, W: int) -> list:
         # offset 순서: [0, -1, +1, -2, +2, ...] 마스크가 "가장 작은 |offset|부터 매칭"되도록
@@ -346,8 +458,7 @@ class HitDetector:
         rearm_mask = diff_z > self.cfg.rearm_height
         next_hit_armed[rearm_mask] = True
 
-        # 접촉 중이면 disarm
-        contact_expanded = contact_mask.any(dim=2, keepdim=True)  # (N,2,1)
-        next_hit_armed = next_hit_armed.masked_fill(contact_expanded, False)
+        # 접촉 중이면 disarm —> 접촉 중이면 disarm. 접촉이 끝나도 바로 rearm 되지 않도록, 충분히 올라가야 rearm.
+        next_hit_armed = next_hit_armed & (~contact_mask)         # (N,2,M) 닿은 드럼만 disarm
 
         return next_hit_armed

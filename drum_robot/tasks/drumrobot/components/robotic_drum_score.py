@@ -12,7 +12,69 @@ from pathlib import Path
 import random
 import time
 
-from .specs import EnvRuntimeSpec, Instruments 
+from .specs import EnvRuntimeSpec, Instruments
+
+
+# ===== 실기 서버 텍스트 악보(.txt) 로더 =====
+#   서버(behavior_planner.cpp make_drum_event)와 같은 규칙으로 읽어 MIDI 로더와 같은 (bpm, events) 를 돌려준다.
+#   형식 (탭 구분):  bpm <값> / bar beat note_R note_L vel_R vel_L kick closed_hihat [...] / end ...
+#     시각  t = beat × 100 / bpm + 직전 t  (누적. 100bpm 에서 beat 1.0 = 1초)
+#     note  robot_config.hpp instrument_name_to_id. 0 = 그 팔 타격 없음
+#     vel   세기 등급 1~7. midi_score.cpp 의 grade = 1 + round(6·v/127) 를 역산해 MIDI velocity(1~127) 로
+#   events 의 악기명은 note_to_drum_idx 의 키와 같게 맞춘다 (서버 id → 시뮬 드럼 인덱스가 1:1 이 되도록).
+RDS_TXT_ID_TO_INSTRUMENT = {
+    0: "Bass Drum 1",      # bass        → pedal_instruments (팔 악보에서 제외)
+    1: "Acoustic Snare",   # snare       → idx 0
+    2: "Low Floor Tom",    # floor       → idx 1
+    3: "Low Tom",          # mid         → idx 2
+    4: "High Tom",         # top         → idx 3
+    5: "Closed Hi Hat",    # closed hihat→ idx 4
+    6: "Ride Cymbal 1",    # ride        → idx 5
+    7: "Chinese Cymbal",   # right crash → idx 6 (crash_r)
+    8: "Crash Cymbal 1",   # left crash  → idx 7 (crash_l)
+    9: "Open Hi-Hat",      # open hihat  → idx 4
+}
+
+
+def rds_txt_grade_to_velocity(grade: int) -> int:
+    """세기 등급(1~7) → MIDI velocity. midi_score.cpp grade = 1 + round(6·vel/127) 의 역산. 5 → 85, 7 → 127."""
+    g = max(1, min(7, int(grade)))
+    return max(1, min(127, int(round((g - 1) * 127.0 / 6.0)))) if g > 1 else 1
+
+
+def read_rds_txt(path) -> tuple[float, list[tuple[float, str, int]]]:
+    """실기 텍스트 악보 → (bpm, [(t_sec, instrument_name, velocity), ...]). MIDI 로더와 같은 반환 형식."""
+    bpm = 100.0
+    last_t = 0.0
+    events: list[tuple[float, str, int]] = []
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        items = [s.strip() for s in raw.split("\t") if s.strip() != ""]
+        if not items:
+            continue
+        if items[0] == "bpm":
+            try:
+                bpm = float(items[1])
+            except (IndexError, ValueError):
+                pass
+            continue
+        if items[0] == "end":
+            break
+        try:
+            beat = float(items[1])
+            note_r, note_l = int(items[2]), int(items[3])
+            vel_r, vel_l = int(items[4]), int(items[5])
+            kick = (int(items[6]) == 1) if len(items) > 6 else False
+        except (IndexError, ValueError):
+            continue   # 서버와 동일: 숫자 줄이 아니면 건너뜀
+        t = beat * 100.0 / bpm + last_t
+        last_t = t
+        for note_id, vel in ((note_r, vel_r), (note_l, vel_l)):
+            if note_id in RDS_TXT_ID_TO_INSTRUMENT and note_id != 0:
+                events.append((t, RDS_TXT_ID_TO_INSTRUMENT[note_id], rds_txt_grade_to_velocity(vel)))
+        if kick:
+            events.append((t, RDS_TXT_ID_TO_INSTRUMENT[0], 100))
+    events.sort()
+    return bpm, events
 
 GENERAL_MIDI_PERCUSSION_KEY_MAP = {
     35: "Acoustic Bass Drum",
@@ -50,6 +112,14 @@ class RDSCfg:
 
     slow_factor: float = 1.5        # slow_factor=2 -> 0.5배속 / slow_factor=0.5 -> 2배속
     start_offset_steps: int = 20
+
+    # 같은 드럼 최소 간격의 ★시간★ 기준. 제어주기를 바꿔도 ms 밀도가 보존된다.
+    #   과거엔 min_gap = 2W+1 (스텝) 만 썼는데, 60Hz→66.667Hz 로 옮기며 7스텝이 116.7ms→105ms 로
+    #   줄어 같은 5초에 들어가는 최대 타격 수(k_max)가 19→22 (+15.8%) 로 늘어 있었다. → miss3_reach 상승.
+    #   _min_gap_steps() 가 max(2W+1, round(min_gap_s / step_dt)) 로 두 제약을 함께 만족시킨다.
+    #     60Hz  : max(7, round(0.116667/0.016667)=7) = 7 스텝 = 116.7ms  (기존과 완전 동일 — 하위 호환)
+    #     66.7Hz: max(7, round(0.116667/0.015)  =8) = 8 스텝 = 120.0ms  → k_max 19 로 복원
+    min_gap_s: float = 0.116667
 
     # 랜덤 생성 시 동시 타격(좌우 쌍) 비율. 0.0=단일만(1단계), 0.2~=2단계
     double_hit_ratio: float = 0.1
@@ -152,6 +222,14 @@ class RDS:
         # util
         self.env_arange = torch.arange(self.env.num_envs, device=self.device)
     
+    def _min_gap_steps(self) -> int:
+        """같은 드럼 연타의 최소 간격[스텝]. 두 제약의 max — 제어주기가 바뀌어도 둘 다 보존된다.
+          ① 판정창 겹침 방지: 2W+1 스텝 (인접 타격의 ±W 창이 안 겹치도록)
+          ② 재장전 물리 시간: RDSCfg.min_gap_s [초] — rearm_height 리프트에 실제로 걸리는 시간
+        ②가 스텝으로 하드코딩돼 있어서 66.667Hz 로 옮길 때 시간 밀도가 13% 늘었던 버그를 막는다."""
+        return max(2 * self.env.hit_window_step + 1,
+                   int(round(self.cfg.min_gap_s / self.env.step_dt)))
+
     def get_next_hits(self, step: torch.Tensor) -> torch.Tensor:
         """
         현재 step 이후 max_lookahead_step 안에 있는 다음 K개 타격 이벤트를 반환.
@@ -318,8 +396,9 @@ class RDS:
         if self.cfg.eval_midi_file:
             p = Path(self.cfg.eval_midi_file)
             if not p.exists():
-                raise ValueError(f"eval MIDI 파일 없음: {p}")
-            print(f"[RDS] eval 전용 단일 MIDI: {p.name}")
+                raise ValueError(f"eval 악보 파일 없음: {p}")
+            kind = "실기 텍스트 악보(.txt)" if p.suffix.lower() == ".txt" else "MIDI"
+            print(f"[RDS] eval 전용 단일 악보 [{kind}]: {p.name}")
             return [p]
 
         folder = Path(self.cfg.midi_folder_path)
@@ -335,15 +414,19 @@ class RDS:
         연주가능성 min_gap 드롭 동일 적용. episode_length_step(T) 초과분은 잘림(play1.py가 T를 충분히 크게 설정)."""
         T = self.env.episode_length_step
         M = self.num_drums
-        bpm, events = self._read_midi_file(midi_files[0])
+        bpm, events = self._read_score_file(midi_files[0])
 
         rds = torch.zeros((T, M), device=self.device, dtype=torch.int64)
-        min_gap = 2 * self.env.hit_window_step + 1
+        min_gap = self._min_gap_steps()
         last_idx = [-(10 ** 9)] * M
         safe_T = T - self.env.hit_window_step
 
-        first = True
+        # 기준 시각: MIDI 는 첫 노트를 0 으로 당긴다(데이터셋 앞 침묵 제거). 실기 텍스트 악보(.txt)는 절대 시각 유지 —
+        #   서버가 첫 줄부터 시간을 세므로 초기 자세→첫 타격까지의 준비 시간이 실기와 같아야 비교가 된다.
+        keep_abs_time = Path(midi_files[0]).suffix.lower() == ".txt"
+        first = not keep_abs_time
         first_t = 0.0
+        offset = 0 if keep_abs_time else self.cfg.start_offset_steps   # .txt 는 시작 오프셋도 없음 (서버 t=0 = 스텝 0)
         placed = 0
         for t, note, vel in events:
             if first:
@@ -352,7 +435,7 @@ class RDS:
             if note not in self.cfg.note_to_drum_idx:
                 continue
             drum_idx = self.cfg.note_to_drum_idx[note]
-            time_idx = int(round(self.cfg.slow_factor * (t - first_t) / self.env.step_dt)) + self.cfg.start_offset_steps
+            time_idx = int(round(self.cfg.slow_factor * (t - first_t) / self.env.step_dt)) + offset
             if time_idx >= safe_T:
                 break   # 곡이 에피소드보다 김 → 잘림
             if time_idx - last_idx[drum_idx] < min_gap:
@@ -374,7 +457,7 @@ class RDS:
         rds_list = []
 
         for file_path in midi_files:
-            bpm, events = self._read_midi_file(file_path)
+            bpm, events = self._read_score_file(file_path)   # .mid → MIDI 로더 / .txt → 실기 텍스트 로더
 
             end_event = False
             prev_t = 0.0
@@ -391,6 +474,14 @@ class RDS:
         rds_tensors = torch.stack(rds_list, dim=0).to(self.device)   # (N, T, M)
         
         return rds_tensors
+
+    def _read_score_file(self, file_path) -> tuple[float, list]:
+        """악보 파일 → (bpm, events). 확장자로 분기: .mid/.midi 는 MIDI 로더(기존 그대로), .txt 는 실기 서버 형식.
+        둘 다 같은 (t_sec, instrument_name, velocity) 리스트를 돌려주므로 이후 경로(마디 분할/full-song)는 공통."""
+        p = Path(file_path)
+        if p.suffix.lower() == ".txt":
+            return read_rds_txt(p)
+        return self._read_midi_file(p)
 
     def _read_midi_file(self, file_path) -> tuple[float, list]:
         mid = MidiFile(file_path)
@@ -453,10 +544,10 @@ class RDS:
         end = True
         next_t = 0.0
 
-        # 연주 가능성 가드: 같은 드럼 최소 간격 (랜덤 브랜치와 동일 min_gap=2W+1).
-        # 실제 MIDI는 빠른 하이햇/플램/고스트노트가 min_gap 미만으로 붙어 있어 (a) 재장전(0.18m 리프트) 불가,
+        # 연주 가능성 가드: 같은 드럼 최소 간격 (랜덤 브랜치와 동일 _min_gap_steps()).
+        # 실제 MIDI는 빠른 하이햇/플램/고스트노트가 min_gap 미만으로 붙어 있어 (a) 재장전(rearm_height 리프트) 불가,
         # (b) 드럼별 hit 윈도우(±W) 겹쳐 채점 꼬임 → 못 치고 채점도 안 되는 조밀 클러스터를 드롭. [[midi-mixing-and-density]]
-        min_gap = 2 * self.env.hit_window_step + 1
+        min_gap = self._min_gap_steps()
         last_idx = [-(10 ** 9)] * M   # 드럼별 마지막 배치 time_idx (events는 시간순 → 클러스터 첫 노트 유지, 이후 드롭)
 
         for t, note, vel in events:
@@ -565,7 +656,7 @@ class RDS:
         s = self.cfg.start_offset_steps
         W = self.env.hit_window_step
         e = T - W
-        min_gap = 2 * W + 1          # 윈도우 겹침 방지 (인접 타격 최소 간격)
+        min_gap = self._min_gap_steps()   # 판정창 겹침(2W+1) + 재장전 시간(min_gap_s) 의 max
         span = e - s
 
         # 배치 가능한 절대 최대 K, 그 중 여유를 둔 k_max (병목 회피 — k_max에서도 간격 흔들 slack 유지)

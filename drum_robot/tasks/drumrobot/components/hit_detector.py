@@ -112,7 +112,9 @@ class HitDetector:
     
     def get_result(
             self,
-            hit_mask: torch.Tensor,
+            hit_mask: torch.Tensor,         # (N, M) 담당 팔의 타격 (담당이 기록되지 않은 타겟은 어느 팔이든). 성공 매칭과 done 처리
+            hit_mask_all: torch.Tensor,     # (N, M) 모든 팔의 실제 타격. 판정 창 밖 오타 판정
+            wrong_arm: torch.Tensor,        # (N, M) 판정 창 안 타겟을 담당 아닌 팔이 침. 오타로 센다
             steps: torch.Tensor,
             rds: torch.Tensor,
             rds_visit: torch.Tensor,
@@ -126,11 +128,11 @@ class HitDetector:
         # 현재 ±W 윈도우 타겟
         window_target_union = self._window_target_union(rds, steps)  # (N, M)
 
-        # 잘못친 타격: 윈도우 밖 타격
-        wrong_hit = hit_mask & (~window_target_union)
+        # 잘못친 타격: 윈도우 밖 타격, 또는 윈도우 안 타겟을 담당 아닌 팔이 친 타격
+        wrong_hit = (hit_mask_all & (~window_target_union)) | wrong_arm
 
-        # 유효 타격(윈도우 안 타격) → 그 타겟 done (재타 downward 억제).
-        # 윈도우 밖 오타/미스는 done 안 켜서 다시 칠 수 있음
+        # 유효 타격(윈도우 안, 담당 팔) → 그 타겟 done (재타 downward 억제).
+        # 윈도우 밖 오타/미스, 담당 아닌 팔의 타격은 done 안 켜서 담당 팔이 다시 칠 수 있음
         valid_hit = hit_mask & window_target_union
         self.target_done = self.target_done | valid_hit
 

@@ -9,6 +9,16 @@ from dataclasses import dataclass
 
 from .specs import EnvRuntimeSpec, Instruments
 
+# 팔 상태 번호. RewardComputer.compute 맨 앞에서 관측에 이미 있는 값으로만 정한다 (정책이 같은 판단을 할 수 있게).
+#   스트로크: 자기 노트까지 stroke_s 이하, 또는 스틱 끝이 드럼 근처에서 빠르게 내려가는 중. 당기지 않음, 정지 벌점 없음
+#   준비 이동: 자기 노트까지 prep_start_s 이하. 노트 위로 당김, 정지 벌점 없음
+#   노는 팔: 맡은 노트가 있고 prep_start_s 보다 멂. 다음 노트 기준 휴식 위치로 당기고, 도착하면 정지 벌점
+#   자유 팔: 맡은 노트가 없음. 스틱 끝에서 수평으로 가장 가까운 드럼 기준 휴식 위치로 당기고, 도착하면 정지 벌점
+ARM_STROKE = 0
+ARM_PREP = 1
+ARM_IDLE = 2
+ARM_FREE = 3
+
 # 모듈 레벨 jit 함수들
 @torch.jit.script
 def _goal_terms(
@@ -38,18 +48,15 @@ def compute_arm_target_assignment(
         right_tip_pos: torch.Tensor,# (N, 3)
         hit_xy_radius: float,       # crowd 판정용 타격영역 XY 반경
         hit_z_range: float,         # crowd 판정용 타격영역 Z 범위
-        ready_height: float,        # 노는 팔 준비 높이 (드럼 위)
-        k_ready: float,             # ready-pose 보상 감쇠 계수
+        ready_height: float,        # 대기점 높이 (드럼 위)
         aim_offset: float,          # 팔별 조준 오프셋 [m] (왼팔 -x, 오른팔 +x)
         assigned_use_left: torch.Tensor,  # (N,) bool 스케줄러가 정한 h0 담당 (왼팔=True)
         assigned_use_case1: torch.Tensor, # (N,) bool 동시타 배정 (왼팔이 idx0 담당이면 True)
         idle_tgt_pos: torch.Tensor,   # (N, 2, 3) 스케줄러가 각 팔에 준 첫 노트 위치 (per_arm_pos[:,:,0,:])
         idle_tgt_valid: torch.Tensor, # (N, 2) bool 그 노트가 유효한가 (per_arm_valid[:,:,0])
-        idle_tgt_time: torch.Tensor,  # (N, 2) 그 노트까지 정규화 시간 (per_arm_time[:,:,0], 1=멀거나 없음)
-        last_drum_pos: torch.Tensor,  # (N, 2, 3) 각 팔이 마지막으로 친 드럼 위치 (배정 없을 때 대기점)
-        k_ready_urgency: float,       # 긴급도 감쇠
-        rest_margin_x: float,         # 휴식 시 미드라인 허용 여유 [m]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pull_note: torch.Tensor,      # (N, 2) bool 준비 이동 상태인 팔 (대기점 = 노트 위)
+        rest_margin_x: float,         # 휴식 위치가 미드라인을 넘어도 되는 여유 [m]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device = target_mask.device
     N, M = target_mask.shape
 
@@ -149,7 +156,7 @@ def compute_arm_target_assignment(
     #
 
     # --------------------
-    # 팔별 역할 (관측 신호용) + 노는 팔 ready-pose 보상
+    # 다음 노트 담당 팔 (관측의 역할 칸에 들어가는 값). 팔 상태 판단과는 별개이며 팔 상태는 RewardComputer.compute 맨 앞에서 정한다
     # --------------------
     active_arm_l = torch.zeros(N, device=device)
     active_arm_r = torch.zeros(N, device=device)
@@ -159,40 +166,28 @@ def compute_arm_target_assignment(
     # case 2: 양팔 모두 활성
     active_arm_l = torch.where(two_mask, torch.ones_like(active_arm_l), active_arm_l)
     active_arm_r = torch.where(two_mask, torch.ones_like(active_arm_r), active_arm_r)
-    active_arm = torch.stack([active_arm_l, active_arm_r], dim=1)   # (N, 2)  1=활성, 0=노는팔
+    active_arm = torch.stack([active_arm_l, active_arm_r], dim=1)   # (N, 2)  1=다음 노트 담당
 
-    # ready-pose: case 1 의 노는 팔을 "드럼 위 ready_height" 에 3D 로 고정.
-    #   기준점은 스케줄러 배정(자기 다음 노트). 배정이 없으면 마지막으로 친 드럼 위에서 대기.
-    #   폴백 기준점은 노트에 따라 움직이지 않는 값이어야 한다 (움직이면 노는 팔이 치는 팔을 따라 흔들림).
-    idle_tip = torch.where(use_left.unsqueeze(-1), right_tip_pos, left_tip_pos)          # (N,3)
-    sched_p  = torch.where(use_left.unsqueeze(-1), idle_tgt_pos[:, 1], idle_tgt_pos[:, 0])   # (N,3)
-    last_p   = torch.where(use_left.unsqueeze(-1), last_drum_pos[:, 1], last_drum_pos[:, 0]) # (N,3)
-    has_tgt  = torch.where(use_left, idle_tgt_valid[:, 1], idle_tgt_valid[:, 0])          # (N,)
-    home_p   = torch.where(has_tgt.unsqueeze(-1), sched_p, last_p)                        # (N,3)
-    # 대기점도 같은 조준 오프셋 (쉬는 팔의 자기 어깨 쪽). use_left=True 이면 쉬는 팔은 오른팔(+x)
-    home_off = torch.zeros_like(home_p)
-    home_off[:, 0] = torch.where(use_left, aim_offset, -aim_offset)
-    home_p = home_p + home_off
+    # 대기점 위치 (팔별 [m]). 관측에 있는 값(팔별 노트 칸, 스틱 끝, 드럼 위치)만으로 정한다.
+    #   기준 드럼: 맡은 노트가 있으면 그 노트, 없으면 스틱 끝에서 수평으로 가장 가까운 드럼.
+    #   준비 이동(pull_note)이면 기준 드럼 위 ready_height.
+    #   그 외는 같은 기준의 휴식 위치: 높이와 앞뒤는 기준과 같고, x 만 미드라인을 rest_margin_x 이상 넘지 못하게 자기 쪽으로 제한
+    #   (반대편에서 기다리지 않게 해 스틱 충돌 방지).
+    tips = torch.stack([left_tip_pos, right_tip_pos], dim=1)                              # (N,2,3)
+    d2_near = ((tips[:, :, None, 0:2] - drum_pos[:, None, :, 0:2]) ** 2).sum(dim=-1)      # (N,2,M)
+    near_p = torch.gather(drum_pos, 1, d2_near.argmin(dim=-1).unsqueeze(-1).expand(-1, -1, 3))   # (N,2,3)
+    base_p = torch.where(idle_tgt_valid.unsqueeze(-1), idle_tgt_pos, near_p)              # (N,2,3)
+    home_list: list[torch.Tensor] = []
+    for a in range(2):
+        sgn = -1.0 if a == 0 else 1.0                                                     # 자기 쪽 x 방향 (왼팔 -x, 오른팔 +x)
+        note_p = base_p[:, a]                                                             # (N,3)
+        note_x = note_p[:, 0] + sgn * aim_offset                                          # 조준 오프셋 (자기 어깨 쪽)
+        rest_x = sgn * torch.clamp(sgn * note_x, min=-rest_margin_x)
+        home_x = torch.where(pull_note[:, a], note_x, rest_x)
+        home_list.append(torch.stack([home_x, note_p[:, 1], note_p[:, 2] + ready_height], dim=-1))
+    home_pos = torch.stack(home_list, dim=1)                                              # (N,2,3)
 
-    # 긴급도: 노트가 임박할수록 1, 멀면 0. 멀면 x 가 휴식 위치로 수렴
-    t_idle = torch.where(use_left, idle_tgt_time[:, 1], idle_tgt_time[:, 0])              # (N,)
-    urgency = torch.exp(-k_ready_urgency * t_idle)                                        # (N,) 0~1
-    # 휴식 x: 미드라인을 rest_margin_x 이상 넘지 못하게. sign 으로 양팔을 같은 식으로 처리
-    sign = torch.where(use_left, torch.ones_like(t_idle), -torch.ones_like(t_idle))       # 쉬는팔 오른=+1
-    own_x = sign * home_p[:, 0]                                                           # >0 = 자기 쪽
-    rest_x = sign * torch.clamp(own_x, min=-rest_margin_x)
-    home_x = rest_x * (1.0 - urgency) + home_p[:, 0] * urgency
-    home_p = torch.cat([home_x.unsqueeze(-1), home_p[:, 1:3]], dim=-1)                    # y, z 는 그대로
-
-    d_xy = idle_tip[:, 0:2] - home_p[:, 0:2]
-    d_z  = idle_tip[:, 2] - (home_p[:, 2] + ready_height)
-    ready_sq = torch.sum(d_xy * d_xy, dim=-1) + d_z * d_z
-    #   동시타(case 2)만 제외. 그때는 쉬는 팔이 없다. 타겟 0개(case 3)는 폴백이 정의돼 있어 그대로 작동
-    ready_pose_reward = torch.where(two_mask, torch.zeros(N, device=device), torch.exp(-k_ready * ready_sq))
-    # XY 전용 도착도 (idle_power 게이트용). z 를 빼서 노는 팔이 집 위에서 위아래로 움직여도 게이트가 유지됨
-    ready_xy = torch.where(two_mask, torch.zeros(N, device=device), torch.exp(-k_ready * torch.sum(d_xy * d_xy, dim=-1)))
-
-    return cost, crowd_pen, active_arm, ready_pose_reward, ready_xy
+    return cost, crowd_pen, active_arm, home_pos
 
 @torch.jit.script
 def _proximity_terms(
@@ -206,23 +201,20 @@ def _proximity_terms(
         hit_xy_radius: float,
         hit_z_range: float,
         ready_height: float,
-        k_ready: float,
         aim_offset: float,
         assigned_use_left: torch.Tensor,
         assigned_use_case1: torch.Tensor,
         idle_tgt_pos: torch.Tensor,
         idle_tgt_valid: torch.Tensor,
-        idle_tgt_time: torch.Tensor,
-        last_drum_pos: torch.Tensor,
-        k_ready_urgency: float,
+        pull_note: torch.Tensor,
         rest_margin_x: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = drum_pos.shape[1]
 
     nearest_target_mask = next_hits[:, 0, :M] > 0.5   # h0
     first_time = next_hits[:, 0, M]
 
-    curr_cost, crowd_pen, active_arm, ready_pose_reward, ready_xy = compute_arm_target_assignment(
+    curr_cost, crowd_pen, active_arm, home_pos = compute_arm_target_assignment(
         target_mask=nearest_target_mask,
         drum_pos=drum_pos,
         left_tip_pos=left_tip_pos,
@@ -230,19 +222,16 @@ def _proximity_terms(
         hit_xy_radius=hit_xy_radius,
         hit_z_range=hit_z_range,
         ready_height=ready_height,
-        k_ready=k_ready,
         aim_offset=aim_offset,
         assigned_use_left=assigned_use_left,
         assigned_use_case1=assigned_use_case1,
         idle_tgt_pos=idle_tgt_pos,
         idle_tgt_valid=idle_tgt_valid,
-        idle_tgt_time=idle_tgt_time,
-        last_drum_pos=last_drum_pos,
-        k_ready_urgency=k_ready_urgency,
+        pull_note=pull_note,
         rest_margin_x=rest_margin_x,
     )
     # prev-position 비용은 진척(progress) 계산용. 배정(assigned_use_left)은 동일하게 주입
-    prev_cost, _, _, _, _ = compute_arm_target_assignment(
+    prev_cost, _, _, _ = compute_arm_target_assignment(
         target_mask=nearest_target_mask,
         drum_pos=drum_pos,
         left_tip_pos=prev_left_tip_pos,
@@ -250,22 +239,19 @@ def _proximity_terms(
         hit_xy_radius=hit_xy_radius,
         hit_z_range=hit_z_range,
         ready_height=ready_height,
-        k_ready=k_ready,
         aim_offset=aim_offset,
         assigned_use_left=assigned_use_left,
         assigned_use_case1=assigned_use_case1,
         idle_tgt_pos=idle_tgt_pos,
         idle_tgt_valid=idle_tgt_valid,
-        idle_tgt_time=idle_tgt_time,
-        last_drum_pos=last_drum_pos,
-        k_ready_urgency=k_ready_urgency,
+        pull_note=pull_note,
         rest_margin_x=rest_margin_x,
     )
 
     proximity_cost = torch.exp(-k_time_to_hit * first_time) * curr_cost
     progress_reward = prev_cost - curr_cost
 
-    return proximity_cost, progress_reward, crowd_pen, active_arm, ready_pose_reward, ready_xy
+    return proximity_cost, progress_reward, crowd_pen, active_arm, home_pos   # home_pos (N,2,3) 팔별 대기점 위치 [m]
 
 @torch.jit.script
 def _self_collision_penalty(
@@ -478,18 +464,21 @@ class RewardComputerCfg:
     k_accuracy: float = 1.0             # 박자 정확도 exp 감쇠 (time_error = 정수 스텝수)
     k_time_to_hit: float = 3.0          # proximity 시간 감쇠 (타격 임박할수록 거리비용 증가)
 
-    # ---------- 노는 팔 준비자세 ----------
-    w_ready: float = 0.6                # 노는 팔이 대기점에 있을 때 보상
-    ready_height: float = 0.18          # 다음 드럼 위 준비높이 [m] (off_target 밴드 0.12 보다 위)
-    k_ready: float = 10.0               # 3D 제곱거리 exp 감쇠
+    # ---------- 대기점 ----------
+    # 대기점 보상: 준비 이동, 노는 팔, 자유 팔 상태에서 대기점으로 당긴다 (스트로크 중에는 끔).
+    #   모양은 원뿔: w x max(0, 1 - 거리 / ready_cone_m). 대기점 바로 옆에서도 1cm 당 같은 양이 줄어 작은 흔들림에도 힘이 남는다
+    #   거리 = 스틱 끝과 대기점 거리, 손목이 가동범위 가운데에서 벗어난 각도를 스틱 끝 거리(stick_len 곱)로 환산해 합친 것
+    w_ready: float = 0.6                # 대기점 보상 시작 계수 (노는 팔 램프 시작 전)
+    w_ready_max: float = 1.2            # 노는 팔 램프 완료 후 계수 (성공률 0.3 에서 0.6)
+    ready_cone_m: float = 0.5           # 원뿔 반경 [m]. 이 거리에서 보상 0
+    ready_height: float = 0.18          # 대기점 높이 [m], 드럼 위 (off_target 밴드 0.12 보다 위)
     stick_len: float = 0.373            # 손목 편차를 팁 호길이 [m] 로 환산 (위치 오차와 같은 단위)
 
     # 팔별 조준 오프셋 [m]: 각 팔이 드럼 중심에서 자기 어깨 쪽으로 비껴 조준
     aim_offset: float = 0.04
 
-    # 대기점 긴급도 가중 + 휴식 x 제한: 쉬는 팔이 반대편으로 미리 건너가 머무는 것을 막는다
-    k_ready_urgency: float = 3.0      # 긴급도 감쇠. 작을수록 더 일찍 노트 위치로 출발
-    rest_margin_x: float = 0.02       # 휴식 시 미드라인을 넘어도 되는 여유 [m]
+    # 노는 자리 x 제한: 노는 팔이 반대편으로 건너가 머무는 것을 막는다 (노트 위로 가는 시점은 env 의 prep_start_s)
+    rest_margin_x: float = 0.02       # 노는 자리가 미드라인을 넘어도 되는 여유 [m]
 
     # 노는 팔 접근 보상 (prev_d - curr_d). 0 이면 미사용. 계산은 env 쪽에 있다
     w_idle_approach: float = 0.0
@@ -511,8 +500,8 @@ class RewardComputerCfg:
     drum_z_margin: float = 0.05         # under_drum 판정 침투깊이 [m]
 
     # ---------- 목표 (타격 성공) ----------
-    w_success: float = 5.5              # 타격 성공. 판정 창 안이면 이진 만점
-    w_wrong: float = 3.0                # 다른 드럼 오타
+    w_success: float = 5.5              # 타격 성공. 판정 창 안이면 이진 만점 (담당 팔이 친 경우만)
+    w_wrong: float = 4.0                # 오타: 판정 창 밖 타격, 또는 담당 아닌 팔이 타겟을 친 경우
     w_miss: float = 3.0                 # 타겟 놓침
     w_time_accuracy: float = 3.0        # 창 안에서의 정확도 등급 exp(-|offset|)
     w_progress: float = 4.0             # 타겟에 가까워진 만큼 (prev_d - curr_d)
@@ -553,23 +542,34 @@ class RewardComputerCfg:
     w_wrist_vel_scale: float = 0.001
     w_elbow_vel_scale: float = 0.001
 
-    # 기계적 일률 |토크 x 각속도|. 무거운 관절 급가속만 비싸고 자세 유지는 비용 0
+    # 기계적 일률 |토크 x 각속도|. 무거운 관절 급가속만 비싸고 자세 유지는 비용 0.
+    w_power_floor: float = 0.0005        # 램프 시작 전 상시값
     w_power_max: float = 0.05           # 램프 A 최대치
     w_power_success_start: float = 0.6  # 램프 A 시작 성공률(EMA)
     w_power_success_full: float = 0.77  # 램프 A 완료
     w_power_ema_beta: float = 0.9       # 성공률 EMA 평활 (갱신 100스텝, 시정수 약 1000스텝)
 
-    # 노는 팔 전용 추가 일률. 마스크 (1 - active_arm) 이라 치는 팔 0, 동시타 0, 허리 제외.
-    # 대기점 도착도(at_home)를 곱해 이동 중에는 과금하지 않는다.
-    # 손목은 토크가 작아 일률로는 잡히지 않으므로 아래 w_wrist_speed_max 가 손목 몫을 맡는다.
-    w_wrist_speed_max: float = 0.02    # 램프 B 최대치. 양 손목 |각속도| 합 L1, 역할 무관
-    idle_home_xy_only: bool = True     # idle_power 게이트를 XY 도착도로 계산 (z 제외)
-    w_idle_power_max: float = 0.1      # 램프 B 최대치
+    # 팔 상태 판정 (compute 맨 앞). 관측의 팔별 다음 노트까지 남은 시간으로 정한다
+    prep_start_s: float = 0.46            # 자기 노트까지 이 시간 이하면 준비 이동 (대기점이 노트 위로 바뀜) [초]
+    stroke_s: float = 0.25                # 자기 노트까지 이 시간 이하면 스트로크 (대기점으로 당기지 않음) [초]
+
+    # 노는 팔 정지 항. 노는 팔과 자유 팔의 움직임
+    idle_near_m: float = 0.1             # 대기점에서 이 거리 안이면 정지 벌점 완전히 켬 [m]
+    idle_far_m: float = 0.20              # 대기점에서 이 거리 밖이면 정지 벌점 끔 [m]
+    w_idle_still_max: float = 0.001       # 팔 항 제곱 부분, 램프 완료 후 계수
+    w_idle_arm_l1_max: float = 0.3        # 팔 항 속도 크기 비례 부분 [1 rad/s 당 스텝마다], 관절별 합. 어깨 0.2 rad/s 흔들림 1초에 약 2.7
+    w_idle_still_success_start: float = 0.3
+    w_idle_still_success_full: float = 0.6
+    idle_vel_sat: float = 9.0             # 팔 항 관절별 각속도 제곱 상한 (3 rad/s). 비례 부분은 이 제곱근에서 자른다
+    # 손목 항. 비례 계수는 같은 스틱 끝 흔들림이면 어깨와 비슷한 벌이 되도록 팔 항 0.2 를 스틱 길이 비율로 맞춘 값
+    w_idle_wrist_floor: float = 0.00005       # 제곱 부분 램프 시작 전 상시값
+    w_idle_wrist_max: float = 0.04            # 제곱 부분 램프 완료 후 계수
+    w_idle_wrist_l1_floor: float = 0.0003    # 비례 부분 램프 시작 전 상시값 (최대값 대비 비율은 제곱 부분과 동일)
+    w_idle_wrist_l1_max: float = 0.24         # 비례 부분 램프 완료 후 계수. 손목 0.3 rad/s 흔들림 1초에 약 4.8
+    idle_wrist_vel_sat: float = 100.0         # 손목 각속도 제곱 상한 (10 rad/s). 절댓값 항은 이 제곱근에서 자른다
 
     # ---------- 자세 ----------
     # 몸통 비틀림 = |sh1_L + sh1_R - 180deg|. 두 shoulder_1 은 같은 기준축이라 각각 90deg 면 그 팔이 몸통 정면,
-    # 합이 180deg 면 두 팔이 몸통 기준 좌우대칭. 허리를 돌리면 합편차가 -2배로 움직이므로
-    # 허리는 합편차의 절반만 돌면 대칭이 회복된다. 회전 방향은 정책이 찾는다.
     w_waist_twist_max: float = 2.0        # 게이팅 없음. 타격 순간에만 적용
     waist_twist_deadzone: float = 0.175   # 10deg 이내 허용 (팔이 안쪽으로 뻗는 건 정상)
     waist_twist_scale: float = 0.35       # 초과분 20deg 에서 만점
@@ -677,18 +677,25 @@ class RewardComputer:
         )
 
         # 게이팅 실효 가중치. 전부 0 에서 시작해 success_ema 에 따라 램프인 (갱신은 update_difficulty_weights)
-        self.w_power_eff = 0.0         # 램프 A (성공률 0.60 에서 0.77)
+        self.w_power_eff = self.cfg.w_power_floor   # 램프 A: floor 에서 시작, 성공률 0.60 에서 0.77 사이에 max 로
         self.w_waist_eff = 0.0         # 램프 A (w_waist_max=0 이면 항상 0)
         self.w_intensity_eff = 0.0     # 램프 B (성공률 0.70 에서 0.75)
         self.w_stick_eff = 0.0         # 램프 B
         self.w_stick_gap_eff = 0.0     # 램프 B (접근 밴드)
-        self.w_idle_power_eff = 0.0    # 램프 B
-        self.w_wrist_speed_eff = 0.0   # 램프 B (손목 각속도 L1)
+        self.w_idle_still_eff = 0.0    # 노는 팔 정지 항 (성공률 0.3 에서 0.6)
+        self.w_idle_wrist_eff = self.cfg.w_idle_wrist_floor   # 노는 팔 손목 제곱 항: floor 에서 시작, 같은 램프로 max 까지
+        self.w_idle_wrist_l1_eff = self.cfg.w_idle_wrist_l1_floor   # 노는 팔 손목 절댓값 항: 위와 같음
+        self.w_idle_arm_l1_eff = 0.0   # 노는 팔 팔 항 속도 비례 부분 (같은 램프)
+        self.w_ready_eff = self.cfg.w_ready   # 대기점 보상 계수: w_ready 에서 시작, 같은 램프로 w_ready_max 까지
         # 이 둘은 반대 방향: 램프 B 가 켜지는 만큼 소거 (크로스페이드)
         self.w_impact_vel_eff = self.cfg.w_impact_vel
         self.w_wrist_snap_eff = self.cfg.w_wrist_snap
         # 체크포인트에 저장되지 않으므로 resume 시 0 에서 다시 올라간다
         self.success_ema = 0.0
+        # 램프 래치: 한 번 올라간 램프는 성공률이 떨어져도 내려가지 않는다 (보상 함수가 성공률을 따라 흔들리지 않게)
+        self.ramp_a_latch = 0.0   # 일률, 허리
+        self.ramp_b_latch = 0.0   # 세기, 스틱, 부트스트랩 크로스페이드
+        self.ramp_s_latch = 0.0   # 노는 팔 정지 항
 
         # 악기별 보상 가중치
         self.update_counter = 0
@@ -727,9 +734,8 @@ class RewardComputer:
             assigned_use_case1: torch.Tensor, # (N,) bool 동시타 배정 (왼팔이 idx0 담당이면 True)
             idle_tgt_pos: torch.Tensor,   # (N,2,3) 스케줄러가 각 팔에 준 첫 노트 (per_arm_pos[:,:,0,:])
             idle_tgt_valid: torch.Tensor, # (N,2) bool 그 노트 유효 (per_arm_valid[:,:,0])
-            idle_tgt_time: torch.Tensor,  # (N,2) 그 노트까지 정규화 시간 (per_arm_time[:,:,0])
-            last_drum_pos: torch.Tensor,  # (N,2,3) 각 팔이 마지막으로 친 드럼 (배정 없을 때 대기점)
-    ) -> tuple[torch.Tensor, dict, dict, torch.Tensor]:  # reward, log, rate_log, active_arm(N,2)
+            idle_tgt_time: torch.Tensor,  # (N,2) 그 노트까지 정규화 시간 (per_arm_time[:,:,0], 관측의 팔별 노트 칸과 같은 값)
+    ) -> tuple[torch.Tensor, dict, dict, torch.Tensor, torch.Tensor]:  # reward, log, rate_log, active_arm(N,2), arm_state(N,2)
         # goal
         success_reward, wrong_cost, missed_cost, time_accuracy_reward = _goal_terms(
             success=success,
@@ -740,8 +746,25 @@ class RewardComputer:
             k_accuracy=self.cfg.k_accuracy,
         )
 
+        # 팔 상태 판정 (N,2). 관측에 이미 있는 값으로만 정한다: 팔별 다음 노트 유효 여부와 남은 시간(팔별 노트 칸),
+        #   스틱 끝 위치와 드럼 위치, 스틱 끝 속도(관측의 관절 각도와 각속도로 정해짐).
+        #   남은 시간은 직전 스텝 관측 값이라 한 스텝 늦지만, 정책이 실제로 본 값과 같게 하려고 그대로 쓴다
+        t_left = idle_tgt_time * float(self.env.max_lookahead_step - 1) * self.env.step_dt          # (N,2) [초]
+        d2_td = ((tip_pos[:, :, None, 0:2] - drum_pos[:, None, :, 0:2]) ** 2).sum(dim=-1)          # (N,2,M)
+        #   내려치는 중: 드럼 근처에서 빠르게 하강 (스틱 간격 면제와 같은 기준). 늦게 치는 팔도 이 조건에 걸린다
+        striking = ((d2_td.min(dim=-1).values < self.cfg.gap_exempt_radius ** 2)
+                    & (tip_vel[:, :, 2] < -self.cfg.gap_exempt_vz))                                 # (N,2)
+        arm_state = torch.full_like(idle_tgt_time, ARM_FREE, dtype=torch.long)
+        arm_state = torch.where(idle_tgt_valid, torch.full_like(arm_state, ARM_IDLE), arm_state)
+        arm_state = torch.where(idle_tgt_valid & (t_left <= self.cfg.prep_start_s),
+                                torch.full_like(arm_state, ARM_PREP), arm_state)
+        arm_state = torch.where((idle_tgt_valid & (t_left <= self.cfg.stroke_s)) | striking,
+                                torch.full_like(arm_state, ARM_STROKE), arm_state)
+        pull_note = arm_state == ARM_PREP                                          # (N,2) 대기점 = 노트 위
+        work = (arm_state == ARM_STROKE) | (arm_state == ARM_PREP)                 # (N,2) 다음 노트를 향해 일하는 팔
+
         # proximity / progress / arm assignment / crowd
-        proximity_cost, progress_reward, crowd_pen, active_arm, ready_pose_reward, ready_xy = _proximity_terms(
+        proximity_cost, progress_reward, crowd_pen, active_arm, home_pos = _proximity_terms(
             left_tip_pos=tip_pos[:, 0, :],
             right_tip_pos=tip_pos[:, 1, :],
             prev_left_tip_pos=prev_tip_pos[:, 0, :],
@@ -752,36 +775,54 @@ class RewardComputer:
             hit_xy_radius=self.cfg.hit_xy_radius,
             hit_z_range=self.cfg.hit_z_range,
             ready_height=self.cfg.ready_height,
-            k_ready=self.cfg.k_ready,
             aim_offset=self.cfg.aim_offset,
             assigned_use_left=assigned_use_left,
             assigned_use_case1=assigned_use_case1,
             idle_tgt_pos=idle_tgt_pos,
             idle_tgt_valid=idle_tgt_valid,
-            idle_tgt_time=idle_tgt_time,
-            last_drum_pos=last_drum_pos,
-            k_ready_urgency=self.cfg.k_ready_urgency,
+            pull_note=pull_note,
             rest_margin_x=self.cfg.rest_margin_x,
         )
 
-        # 쉬는 팔 손목을 가동범위 중앙으로. 중앙이어야 양방향 스냅 여유가 생긴다.
-        #   ready_pose 에 곱하는 것은 ready_sq 에 손목항을 더하는 것과 같다 (exp 의 곱). jit 시그니처를 바꾸지 않기 위한 형태.
+        # 대기점 보상 (원뿔): 스트로크가 아닌 팔(준비 이동, 노는 팔, 자유 팔)마다 max(0, 1 - 거리 / ready_cone_m) 를 더한다. 계수는 w_ready_eff.
+        #   거리에는 손목이 가동범위 중앙에서 벗어난 각도를 스틱 끝 호길이로 환산해 합친다. 중앙이어야 양방향 스냅 여유가 생긴다.
+        #   자유 팔은 노는 팔 램프(ramp_s_latch)만큼만 당긴다. 처음부터 당기면 타격을 배우기 전에 대기점에 떠 있는 쪽으로 굳는다
+        home_dist = torch.linalg.norm(tip_pos - home_pos, dim=-1)            # (N,2) 대기점까지 거리 [m]
         w_ang = robot_pos[:, self.wrist_ids]                                  # (N,2) 손목각
         w_lo  = joint_low[:,  self.wrist_ids]                                 # (1,2)
         w_hi  = joint_high[:, self.wrist_ids]
         w_rng = (w_hi - w_lo).clamp(min=1e-6)
         w_frac = (w_ang - w_lo) / w_rng                                       # (N,2) 0=하한, 1=상한
         w_dev = w_ang - 0.5 * (w_lo + w_hi)                                   # (N,2) 중앙 대비 편차
-        idle_dev = torch.where(assigned_use_left, w_dev[:, 1], w_dev[:, 0])   # (N,) 왼팔이 치면 오른 손목
-        d_wrist = self.cfg.stick_len * idle_dev                               # 호길이 [m]
-        # idle_power 게이트: 기본은 XY 전용 도착도 (노는 팔이 위아래로 움직여도 게이트 유지)
-        at_home = ready_xy if self.cfg.idle_home_xy_only else ready_pose_reward   # (N,)
-        ready_pose_reward = ready_pose_reward * torch.exp(-self.cfg.k_ready * d_wrist * d_wrist)
-        idle_wrist_frac = torch.where(assigned_use_left, w_frac[:, 1], w_frac[:, 0])   # (N,) 로그용
+        d_wrist = self.cfg.stick_len * w_dev                                  # (N,2) 호길이 [m]
+        ready_d = torch.sqrt(home_dist * home_dist + d_wrist * d_wrist)       # (N,2) 대기 자세까지 거리 [m]
+        ready_arm = (1.0 - ready_d / self.cfg.ready_cone_m).clamp(min=0.0)    # (N,2) 원뿔 0~1
+        pull_on = (((arm_state == ARM_PREP) | (arm_state == ARM_IDLE)).float()
+                   + (arm_state == ARM_FREE).float() * self.ramp_s_latch)     # (N,2) 대기점으로 당기는 정도
+        ready_pose_reward = (pull_on * ready_arm).sum(dim=-1)                 # (N,) 당기는 상태의 팔마다 받는다
+
+        # 노는 팔 스위치 (N,2, 0~1): 정지 벌점과 노는 팔 로그가 쓴다. 준비 이동과 스트로크는 0
+        #   노는 팔과 자유 팔: 대기점 idle_near_m 안이면 1, idle_far_m 밖이면 0, 사이는 거리 비례 (옮겨 가는 이동은 과금하지 않음)
+        near = ((self.cfg.idle_far_m - home_dist)
+                / max(self.cfg.idle_far_m - self.cfg.idle_near_m, 1e-6)).clamp(0.0, 1.0)              # (N,2)
+        resting_state = (arm_state == ARM_IDLE) | (arm_state == ARM_FREE)                              # (N,2)
+        idle_gate = torch.where(resting_state, near, torch.zeros_like(near))                          # (N,2)
+        n_idle = idle_gate.sum(dim=-1)                                        # (N,)
+        idle_wrist_frac = torch.where(n_idle > 0.0, (idle_gate * w_frac).sum(dim=-1) / n_idle.clamp(min=1e-6),
+                                      torch.full_like(n_idle, 0.5))           # (N,) 로그용, 노는 팔 평균
 
         # off-target 페널티에서 제외할 현재 타겟 마스크 (h0)
         M = drum_pos.shape[1]
         target_mask = next_hits[:, 0, :M] > 0.5
+
+        # 다음 노트로 다가가게 하는 두 항(거리 비용, 다가간 만큼 보상)은 그 노트 담당 팔이 준비 이동이나 스트로크일 때만 켠다.
+        #   노트가 멀어 담당 팔이 노는 팔 상태인데 다가가라고 하면, 노는 자리에 있으라는 대기점 보상, 정지 벌점과 반대가 된다.
+        #   동시 2타는 두 팔 중 하나라도 일하는 상태면 켠다
+        two_mask = target_mask.float().sum(dim=-1) >= 2.0                     # (N,)
+        owner_work = torch.where(two_mask, work.any(dim=1),
+                                 torch.where(assigned_use_left, work[:, 0], work[:, 1])).float()   # (N,)
+        proximity_cost = proximity_cost * owner_work
+        progress_reward = progress_reward * owner_work
 
         # tip position penalties
         tip_limit_pen, under_drum_pen, off_target_pen = _tip_position_penalties(
@@ -914,7 +955,7 @@ class RewardComputer:
             waist_vel_pen=waist_vel_pen,
             w_waist=self.w_waist_eff,
             ready_pose_reward=ready_pose_reward,
-            w_ready=self.cfg.w_ready,
+            w_ready=self.w_ready_eff,
         )
 
         # 이하 jit 밖에서 적용 (compute_rewards 시그니처 고정)
@@ -946,17 +987,11 @@ class RewardComputer:
         stick_gap_pen = torch.clamp(self.cfg.stick_gap_range - stick_dist, min=0.0) * gap_gate
         reward = reward - self.w_stick_gap_eff * stick_gap_pen
 
-        # [진단] 쉬는 팔 대기점이 자기 반대편인지 (ready_pose 가 크로스를 명령하는지 측정)
-        _tgt_n = target_mask.float().sum(dim=-1)                                  # (N,) h0 타겟 개수
-        _sched = torch.where(assigned_use_left.unsqueeze(-1), idle_tgt_pos[:, 1], idle_tgt_pos[:, 0])
-        _last  = torch.where(assigned_use_left.unsqueeze(-1), last_drum_pos[:, 1], last_drum_pos[:, 0])
-        _has   = torch.where(assigned_use_left, idle_tgt_valid[:, 1], idle_tgt_valid[:, 0])
-        _home  = torch.where(_has.unsqueeze(-1), _sched, _last)                   # (N,3)
-        _f_one = (_tgt_n == 1.0).float()
-        #   use_left=True 이면 쉬는 팔은 오른팔이고, home_x < 0 이면 크로스
-        _idle_is_right = assigned_use_left
-        _home_x = _home[:, 0]
-        _crossed = torch.where(_idle_is_right, _home_x < 0.0, _home_x > 0.0).float()
+        # [진단] 노는 팔(맡은 노트 있음)의 대기점이 자기 반대편인지 (대기점이 크로스를 명령하는지 측정). 분모 = 노는 팔 수
+        #   대기점 = 위 home_pos (보상이 실제로 당기는 위치). 왼팔(0)은 x > 0, 오른팔(1)은 x < 0 이면 반대편
+        _hx = home_pos[:, :, 0]                                                    # (N,2)
+        _crossed = torch.stack([_hx[:, 0] > 0.0, _hx[:, 1] < 0.0], dim=1).float()  # (N,2)
+        _idle_note = (arm_state == ARM_IDLE).float()                               # (N,2)
 
         # 몸통 비틀림: 타격 순간 |sh1_L + sh1_R - 180deg|. 합 180deg 가 두 팔의 좌우대칭.
         # 타격 순간에만 적용하므로 안 치는 스텝은 0
@@ -968,16 +1003,23 @@ class RewardComputer:
         waist_twist_pen = twist_n * twist_n * any_hit_f                         # (N,)
         reward = reward - self.cfg.w_waist_twist_max * waist_twist_pen
 
-        # 노는 팔 일률: 치는 팔은 마스크 0, 허리는 공용이라 제외.
-        #   at_home 을 곱해 대기점에 도착한 뒤에만 과금 (이동 중에는 무료)
-        arm_pw = (robot_torque[:, self.arm_joint_ids] * robot_vel[:, self.arm_joint_ids]).abs()  # (N,2,4)
-        arm_power = arm_pw.sum(dim=-1)                                          # (N,2) 팔별 기계일률
-        idle_power = ((1.0 - active_arm) * arm_power).sum(dim=-1) * at_home     # (N,) 노는 팔 몫 x 도착도
-        reward = reward - self.w_idle_power_eff * idle_power
-
-        # 손목 각속도 L1: 양 손목, 역할 무관 (손목은 토크가 작아 일률로는 잡히지 않는다)
-        wrist_speed_l1 = robot_vel[:, self.wrist_ids].abs().sum(dim=-1)        # (N,)
-        reward = reward - self.w_wrist_speed_eff * wrist_speed_l1
+        # 노는 팔 정지 항: 대기점에 도착한 노는 팔과 드럼 구역 밖의 자유 팔은 움직일 이유가 없으므로, 움직이는 만큼 낸다.
+        #   팔 항: 어깨1, 어깨2, 팔꿈치. 제곱 부분 = 관절별 idle_vel_sat 에서 자른 각속도 제곱의 평균,
+        #          비례 부분 = 관절별 각속도 크기(3 rad/s 에서 자름)의 합
+        #   손목 항: 제곱 부분과 비례 부분. 둘 다 idle_wrist_vel_sat 기준으로 자른다
+        #   관절 각속도는 몸통 기준이라 허리 회전은 들어가지 않는다
+        arm_v = robot_vel[:, self.arm_joint_ids]                                                       # (N,2,4) 어깨1, 어깨2, 팔꿈치, 손목
+        v2_arm = (arm_v[..., :3] ** 2).clamp(max=self.cfg.idle_vel_sat).mean(dim=-1)                   # (N,2)
+        v1_arm = arm_v[..., :3].abs().clamp(max=self.cfg.idle_vel_sat ** 0.5).sum(dim=-1)              # (N,2)
+        v2_wrist = (arm_v[..., 3] ** 2).clamp(max=self.cfg.idle_wrist_vel_sat)                         # (N,2)
+        v1_wrist = arm_v[..., 3].abs().clamp(max=self.cfg.idle_wrist_vel_sat ** 0.5)                   # (N,2)
+        #   과금 여부는 위의 노는 팔 스위치 idle_gate 를 그대로 쓴다
+        idle_still = (idle_gate * v2_arm).sum(dim=-1)                                                  # (N,)
+        idle_arm_l1 = (idle_gate * v1_arm).sum(dim=-1)                                                 # (N,)
+        idle_wrist = (idle_gate * v2_wrist).sum(dim=-1)                                                # (N,)
+        idle_wrist_l1 = (idle_gate * v1_wrist).sum(dim=-1)                                             # (N,)
+        reward = (reward - self.w_idle_still_eff * idle_still - self.w_idle_arm_l1_eff * idle_arm_l1
+                  - self.w_idle_wrist_eff * idle_wrist - self.w_idle_wrist_l1_eff * idle_wrist_l1)
 
         num_hit_drum = success.float() + missed_target.float()
 
@@ -996,7 +1038,16 @@ class RewardComputer:
             "idle_wrist_frac": idle_wrist_frac,        # 쉬는 팔 손목 위치 (0=하한, 0.5=중앙, 1=상한)
             "wrist_limit_pen(x100)": wrist_limit_pen * 100,
             "waist_twist_pen": waist_twist_pen,
-            "idle_power": idle_power,
+            "idle_still": idle_still,                  # 노는 팔 정지 팔 항 제곱 부분 원값 (x w_idle_still_eff 이 차감량)
+            "w_idle_still_eff(x1000)": torch.full_like(reward, self.w_idle_still_eff * 1000.0),
+            "idle_arm_l1": idle_arm_l1,                # 노는 팔 정지 팔 항 비례 부분 원값 (x w_idle_arm_l1_eff 이 차감량)
+            "w_idle_arm_l1_eff(x1000)": torch.full_like(reward, self.w_idle_arm_l1_eff * 1000.0),
+            "w_ready_eff(x1000)": torch.full_like(reward, self.w_ready_eff * 1000.0),
+            "idle_wrist": idle_wrist,                  # 노는 팔 손목 제곱 항 원값 (x w_idle_wrist_eff 이 차감량)
+            "w_idle_wrist_eff(x1000)": torch.full_like(reward, self.w_idle_wrist_eff * 1000.0),
+            "idle_wrist_l1": idle_wrist_l1,            # 노는 팔 손목 절댓값 항 원값 (x w_idle_wrist_l1_eff 이 차감량)
+            "w_idle_wrist_l1_eff(x1000)": torch.full_like(reward, self.w_idle_wrist_l1_eff * 1000.0),
+            "idle_gate": idle_gate.mean(dim=-1),       # 과금 게이트 평균 (1=양팔 모두 과금 구간)
             "crowd_pen": crowd_pen,
             "self_collision_pen": self_col_pen,
             "forearm_dist": forearm_dist,
@@ -1020,7 +1071,7 @@ class RewardComputer:
             # 스틱 접촉률: 임계 미만인 스텝 비율
             "stick_contact": torch.stack([(stick_dist < self.cfg.stick_contact_threshold).float(), torch.ones_like(stick_dist)], dim=-1),
             # 쉬는 팔 대기점이 반대편인 비율
-            "home_crossed": torch.stack([_crossed * _f_one, _f_one], dim=-1),
+            "home_crossed": torch.stack([(_crossed * _idle_note).sum(dim=-1), _idle_note.sum(dim=-1)], dim=-1),
             # 스틱 거리 분포 꼬리
             "stick_lt_60mm": torch.stack([(stick_dist < 0.060).float(), torch.ones_like(stick_dist)], dim=-1),
             # 하강 구간 면제 비율
@@ -1042,16 +1093,35 @@ class RewardComputer:
             cnt = bm.sum(dim=-1)
             rate_log_terms[f"dyn_elbow_{tag}"]  = torch.stack([(success_elbow_apex * bm).sum(dim=-1), cnt], dim=-1)
 
-        # 노는 팔 동기 헛스윙 진단: 타격이 난 스텝에서 노는 팔의 손목 각속도 / 팁 수직속도. 목표는 0
-        idle_mask = 1.0 - active_arm                                           # (N,2) 1=노는 팔
-        w_abs = robot_vel[:, self.wrist_ids].abs()                             # (N,2)
-        vz_abs = tip_vel[:, :, 2].abs()                                        # (N,2)
-        hit_now = hit_per_arm.any(dim=2).any(dim=1).float()                    # (N,) 이 스텝 타격 발생
-        n_idle_hit = idle_mask.sum(dim=1) * hit_now                            # (N,) 분모
-        rate_log_terms["idle_wrist_at_hit"] = torch.stack([(idle_mask * w_abs).sum(dim=1) * hit_now, n_idle_hit], dim=-1)
-        rate_log_terms["idle_vz_at_hit"]    = torch.stack([(idle_mask * vz_abs).sum(dim=1) * hit_now, n_idle_hit], dim=-1)
+        # 가만히 있어야 할 팔 진단. 노는 팔 스위치가 완전히 켜진 팔이고, 이번 스텝에 스스로 친 팔은 뺀다.
+        #   그래서 이번 스텝 타격이 있으면 다른 팔이 친 것이다
+        #   손목 액션 0.1 은 정상상태에서 손목 약 1 rad/s 에 해당한다. 속도에 비해 액션이 작으면 몸 흔들림으로 생긴 움직임
+        hit_self = hit_per_arm.any(dim=2)                                      # (N,2) 이번 스텝 그 팔이 침
+        resting = ((idle_gate >= 0.999) & (~hit_self)).float()                 # (N,2) 1=가만히 있어야 할 팔
+        notgt = resting * (~idle_tgt_valid).float()                            # (N,2) 그중 맡은 노트가 아예 없는 팔
+        w_abs = robot_vel[:, self.wrist_ids].abs()                             # (N,2) 손목 각속도 크기 [rad/s]
+        w_act = actions[:, self.wrist_ids].abs()                               # (N,2) 손목 액션 크기 [0~1]
+        vz_abs = tip_vel[:, :, 2].abs()                                        # (N,2) 스틱 끝 수직 속도 크기 [m/s]
+        hit_now = hit_per_arm.any(dim=2).any(dim=1).float().unsqueeze(1)       # (N,1) 이번 스텝 타격 발생
+        rest_hit = resting * hit_now                                           # (N,2) 다른 팔이 친 순간의 가만히 있어야 할 팔
 
-        return reward, log_terms, rate_log_terms, active_arm
+        def _pair(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:      # (N,2) 두 팔 합을 (분자, 분모) 로
+            return torch.stack([num.sum(dim=1), den.sum(dim=1)], dim=-1)
+
+        rate_log_terms["rest_frac"]             = _pair(resting, torch.ones_like(resting))
+        rate_log_terms["rest_wrist"]            = _pair(resting * w_abs, resting)
+        rate_log_terms["rest_wrist_act"]        = _pair(resting * w_act, resting)
+        rate_log_terms["rest_wrist_at_hit"]     = _pair(rest_hit * w_abs, rest_hit)
+        rate_log_terms["rest_vz_at_hit"]        = _pair(rest_hit * vz_abs, rest_hit)
+        rate_log_terms["rest_wrist_act_at_hit"] = _pair(rest_hit * w_act, rest_hit)
+        rate_log_terms["rest_wrist_notgt"]      = _pair(notgt * w_abs, notgt)
+
+        # 팔 상태 비율 (분모 = 팔 수 x 스텝). 상태 판단이 의도대로 나오는지 확인용
+        _ones2 = torch.ones_like(idle_gate)
+        for _tag, _code in (("stroke", ARM_STROKE), ("prep", ARM_PREP), ("idle", ARM_IDLE), ("free", ARM_FREE)):
+            rate_log_terms[f"state_{_tag}"] = _pair((arm_state == _code).float(), _ones2)
+
+        return reward, log_terms, rate_log_terms, active_arm, arm_state
 
     def update_difficulty_weights(
             self,
@@ -1085,22 +1155,32 @@ class RewardComputer:
             denom = max(self.cfg.w_power_success_full - self.cfg.w_power_success_start, 1e-6)
             ramp = (self.success_ema - self.cfg.w_power_success_start) / denom
             ramp = min(max(ramp, 0.0), 1.0)
-            self.w_power_eff = self.cfg.w_power_max * ramp
-            self.w_waist_eff = self.cfg.w_waist_max * ramp   # 허리 페널티도 동일 게이팅
+            self.ramp_a_latch = max(self.ramp_a_latch, ramp)
+            self.w_power_eff = self.cfg.w_power_floor + (self.cfg.w_power_max - self.cfg.w_power_floor) * self.ramp_a_latch
+            self.w_waist_eff = self.cfg.w_waist_max * self.ramp_a_latch   # 허리 페널티도 동일 게이팅
 
             # 세기 매칭은 별도 램프 (램프 B). 타격을 먼저 익힌 뒤 세기
             denom_i = max(self.cfg.w_intensity_success_full - self.cfg.w_intensity_success_start, 1e-6)
             ramp_i = (self.success_ema - self.cfg.w_intensity_success_start) / denom_i
             ramp_i = min(max(ramp_i, 0.0), 1.0)
-            self.w_intensity_eff = self.cfg.w_intensity_max * ramp_i
-            # 스틱 페널티, 노는 팔 항도 같은 램프 (스킬이 굳은 뒤에만 켜서 초기 탐색에 영향 없음)
-            self.w_stick_eff = self.cfg.w_stick_contact_max * ramp_i
-            self.w_stick_gap_eff = self.cfg.w_stick_gap_max * ramp_i
-            self.w_idle_power_eff = self.cfg.w_idle_power_max * ramp_i   # 노는 팔 일률
-            self.w_wrist_speed_eff = self.cfg.w_wrist_speed_max * ramp_i # 손목 각속도 L1
+            self.ramp_b_latch = max(self.ramp_b_latch, ramp_i)
+            self.w_intensity_eff = self.cfg.w_intensity_max * self.ramp_b_latch
+            # 스틱 페널티도 같은 램프 (스킬이 굳은 뒤에만 켜서 초기 탐색에 영향 없음)
+            self.w_stick_eff = self.cfg.w_stick_contact_max * self.ramp_b_latch
+            self.w_stick_gap_eff = self.cfg.w_stick_gap_max * self.ramp_b_latch
+            # 노는 팔 정지 항: 타격을 찾은 뒤(0.3)부터 켜서 0.6 에서 최대
+            denom_s = max(self.cfg.w_idle_still_success_full - self.cfg.w_idle_still_success_start, 1e-6)
+            ramp_s = (self.success_ema - self.cfg.w_idle_still_success_start) / denom_s
+            self.ramp_s_latch = max(self.ramp_s_latch, min(max(ramp_s, 0.0), 1.0))
+            self.w_idle_still_eff = self.cfg.w_idle_still_max * self.ramp_s_latch
+            self.w_idle_arm_l1_eff = self.cfg.w_idle_arm_l1_max * self.ramp_s_latch
+            self.w_ready_eff = self.cfg.w_ready + (self.cfg.w_ready_max - self.cfg.w_ready) * self.ramp_s_latch
+            self.w_idle_wrist_eff = self.cfg.w_idle_wrist_floor + (self.cfg.w_idle_wrist_max - self.cfg.w_idle_wrist_floor) * self.ramp_s_latch
+            self.w_idle_wrist_l1_eff = (self.cfg.w_idle_wrist_l1_floor
+                                        + (self.cfg.w_idle_wrist_l1_max - self.cfg.w_idle_wrist_l1_floor) * self.ramp_s_latch)
             # 크로스페이드: 세기 매칭이 켜지는 만큼 부트스트랩 항을 페이드아웃
-            self.w_impact_vel_eff = self.cfg.w_impact_vel * (1.0 - ramp_i)
-            self.w_wrist_snap_eff = self.cfg.w_wrist_snap * (1.0 - ramp_i)
+            self.w_impact_vel_eff = self.cfg.w_impact_vel * (1.0 - self.ramp_b_latch)
+            self.w_wrist_snap_eff = self.cfg.w_wrist_snap * (1.0 - self.ramp_b_latch)
 
             # 통계 초기화
             self.n_success.zero_()

@@ -17,7 +17,7 @@ PRIM_PATH = "/World/envs/env_.*/Robot"   # env_.* 를 써야 여러 환경에 �
 # step_dt = SIM_DT x decimation = 0.0075 x 2 = 0.015s = 66.667Hz (정책 주기)
 # 실기 send_loop 가 200Hz(5ms)이고 정책은 그 정수 분주여야 하므로 200 / 66.667 = 3틱으로 맞춘다.
 # 이 값을 바꾸면 action_scale 도 반비례로 바꿔야 한다 (아래 action_scale 주석 참조).
-# 주기를 바꿀 때는 fresh 가 아니라 resume 으로 학습한다 (타격을 아는 정책에서 출발해야 탐색 폭 변화의 영향이 없다).
+# 주기를 ㄷ바꿀 때는 fresh 가 아니라 resume 으로 학습한다 (타격을 아는 정책에서 출발해야 탐색 폭 변화의 영향이 없다).
 SIM_DT = 0.0075
 DEVICE = "cuda"
 
@@ -35,7 +35,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     # 세기 게이팅(0.7)보다 먼저 시작하도록 문턱을 어긋나게 둔다.
     midi_success_start: float = 0.65  # 이 성공률(EMA)부터 MIDI 섞기 시작
     midi_success_full: float = 0.90   # 이 성공률에서 final_ratio 도달
-    midi_final_ratio: float = 0.35    # 최종 MIDI 비율 (나머지는 랜덤 악보)
+    midi_final_ratio: float = 0.65    # 최종 MIDI 비율 (나머지는 랜덤 악보)
     midi_selection_strength: float = 0.5       # MIDI 샘플링 스코어 가중 (0=완전랜덤, 클수록 스코어 선별)
 
     # 평가(play1.py)용. 기본값이면 학습과 동일. play1.py 가 오버라이드한다
@@ -46,30 +46,32 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
 
     # 배정 히스테리시스: h0 담당팔을 바꾸려면 상대 팔 점수가 이 비율만큼 더 좋아야 한다.
     #   배정 점수는 스케일 차이가 커서 절대 마진 대신 상대(비율) 마진을 쓴다.
-    #   경계 채터링만 차단하고 재장전 BIG(1e3) 교대는 그대로 통과한다.
     sched_hysteresis: float = 0.25
 
     # 교차 배정 페널티 [배율]. 왼팔이 우측(x>0) 드럼, 오른팔이 좌측(x<0) 드럼을 맡을 때
     #   반대편 침범량[m] x 이 값을 추가 이동거리로 과금한다.
-    #   arm_score 가 현재 팁 위치만 보면 한 번 교차한 팔이 계속 이기는 자기강화가 생기므로,
-    #   드럼 x 와 팔 정체성만으로 결정되는 이 항이 그 고리를 끊는다.
     sched_cross_penalty: float = 1.5
 
     # 지령 각속도 상한 [rad/s]. 물리적으로 의미 있는 값은 action_scale x step_dt = dq_max
-    action_scale: float = 18       # 기본 관절 지령 각속도 상한 [rad/s]
-    wrist_action_scale: float = 55.5556    # 손목만 상한 크게 (세기 f 밴드 + 빠른 패시지)
+    action_scale: float = 13      # 기본 관절 지령 각속도 상한 [rad/s]
+    wrist_action_scale: float = 70    # 손목만 상한 크게 (세기 f 밴드 + 빠른 패시지)
 
     # 제어 지연 [물리 스텝]. 1스텝 = SIM_DT = 7.5ms. 0 이면 지연 없음.
     action_delay_steps_min: int = 1      # 0 이면 지연 없음. min == max 이면 고정 지연
     action_delay_steps_max: int = 2      # env 별로 [min, max] 균등 추첨 (리셋마다)
 
+    # 리바운드 주입. 드럼은 좌표점 그대로 두고, 팁이 헤드 면을 아래로 통과한 스텝에 그 팔의 손목 각속도를 -e 배로 반전한다.
+    rebound_enabled: bool = False
+    rebound_e_drum: float = 0.7          # 스네어, 탐 3개
+    rebound_e_cymbal: float = 0.4        # hihat, ride, crash_r, crash_l
+    rebound_e_jitter: float = 0.15        # 학습 DR 폭. 0.1 이면 e 가 [e-0.1, e+0.1] 균등 (리셋마다)
+    rebound_plane_offset: float = 0.0     # 헤드 면 높이 = drum_z + 이 값 [m]. 실기 헤드가 시뮬 드럼 원점보다 낮으면 음수
+    rebound_xy_radius: float = 0.13       # 면 통과를 인정하는 XY 반경 [m]. 판정기 drum_xy_radius 와 동일값 유지
+
     # 관측값 정규화
     joint_vel_scale: float = 5.0
 
     # [sim2real 점검] 손목 속도 obs 를 실기와 같은 유한차분 (q_t - q_{t-1})/step_dt 로 대체할지.
-    #   실기는 Maxon 이 velocity 를 보고하지 않아 차분으로 추정한다 (참값 대비 step_dt/2 위상 지연).
-    #   학습은 False(물리엔진 참값). True 로 play1 을 돌렸을 때의 성적 하락이 이 채널의 배포 갭 추정치.
-    #   obs 전용이며 보상은 참값을 그대로 쓴다.
     wrist_vel_finite_diff: bool = False
 
     # Simulation
@@ -102,9 +104,6 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
         ),
         prim_path=PRIM_PATH,
         #   waist: TMotor AK10_9 (gear 9),  arm: TMotor AK70_10 (gear 10),  wrist: Maxon DCX22L+GPX22HP (gear 35)
-        #   waist/arm 은 실기 MIT 모드(tau = Kp x dp + Kd x dv)와 식이 같아 Kp/Kd 를 그대로 쓴다. 실기 상한 Kd <= 5.
-        #   손목은 실기 CST 모드(서버가 PD 계산)이며 stiffness = control_kp x gear / 1000, damping = control_kd x gear / 1000.
-        #   effort/velocity_limit 는 데이터시트 근사값.
         actuators={
             "waist": ImplicitActuatorCfg(
                 joint_names_expr=["waist_joint"],

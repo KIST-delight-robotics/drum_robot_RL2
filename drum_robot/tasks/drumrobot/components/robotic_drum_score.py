@@ -108,17 +108,15 @@ GENERAL_MIDI_PERCUSSION_KEY_MAP = {
 
 @dataclass
 class RDSCfg:
-    midi_folder_path: str = "/home/shy/RL_workspace/IsaacLab/source/extensions/drum_robot/drum_robot/MIDIs"
+    #midi_folder_path: str = "/home/shy/RL_workspace/IsaacLab/source/extensions/drum_robot/drum_robot/MIDIs"
+    midi_folder_path: str = "/home/shy/RL_workspace/IsaacLab/source/extensions/drum_robot/drum_robot/MIDIs_train"
+
+
 
     slow_factor: float = 1.5        # slow_factor=2 -> 0.5배속 / slow_factor=0.5 -> 2배속
     start_offset_steps: int = 20
 
-    # 같은 드럼 최소 간격의 ★시간★ 기준. 제어주기를 바꿔도 ms 밀도가 보존된다.
-    #   과거엔 min_gap = 2W+1 (스텝) 만 썼는데, 60Hz→66.667Hz 로 옮기며 7스텝이 116.7ms→105ms 로
-    #   줄어 같은 5초에 들어가는 최대 타격 수(k_max)가 19→22 (+15.8%) 로 늘어 있었다. → miss3_reach 상승.
-    #   _min_gap_steps() 가 max(2W+1, round(min_gap_s / step_dt)) 로 두 제약을 함께 만족시킨다.
-    #     60Hz  : max(7, round(0.116667/0.016667)=7) = 7 스텝 = 116.7ms  (기존과 완전 동일 — 하위 호환)
-    #     66.7Hz: max(7, round(0.116667/0.015)  =8) = 8 스텝 = 120.0ms  → k_max 19 로 복원
+    # 같은 드럼 최소 간격의 시간 기준. 제어주기를 바꿔도 ms 밀도가 보존된다.
     min_gap_s: float = 0.116667
 
     # 랜덤 생성 시 동시 타격(좌우 쌍) 비율. 0.0=단일만(1단계), 0.2~=2단계

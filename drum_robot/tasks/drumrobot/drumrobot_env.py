@@ -16,7 +16,7 @@ from .components.specs import EnvRuntimeSpec, Instruments
 from .components.robot_interface import RobotInterface
 from .components.robotic_drum_score import RDSCfg, RDS
 from .components.hit_detector import HitDetector, HitDetectorCfg
-from .components.reward import RewardComputerCfg, RewardComputer
+from .components.reward import RewardComputerCfg, RewardComputer, ARM_IDLE, ARM_FREE
 from .components.robot_initializer import RobotInitializerCfg, RobotInitializer
 from .components.visualizer import VisualizerCfg, Visualizer
 
@@ -156,6 +156,19 @@ class DrumRobotEnv(DirectRLEnv):
             [name_to_idx["left_wrist"], name_to_idx["right_wrist"]],
             device=self.device, dtype=torch.long,
         )
+        # 리바운드 주입용: 드럼별 반발계수 (M,) 와 env 별 DR 값 (N,M). 손목 USD 관절 인덱스는 속도를 USD 프레임에서
+        #   그대로 뒤집으므로 부호 변환이 필요 없다
+        _cymbals = {"hihat", "ride", "crash_r", "crash_l"}
+        self.rebound_e = torch.tensor(
+            [self.cfg.rebound_e_cymbal if n in _cymbals else self.cfg.rebound_e_drum
+             for n in self.instruments.all.keys()],
+            device=self.device, dtype=torch.float32,
+        )                                                                   # (M,)
+        self.rebound_e_env = self.rebound_e.unsqueeze(0).repeat(self.num_envs, 1)   # (N,M)
+        self.wrist_usd_ids = [self.robot_interface.get_ctrl_joint_ids()[i] for i in self.wrist_joint_ids.tolist()]
+        if self.cfg.rebound_enabled:
+            print(f"[REBOUND] e per drum = {dict(zip(self.instruments.all.keys(), self.rebound_e.tolist()))}"
+                  f"  jitter={self.cfg.rebound_e_jitter}")
         # [sim2real 점검] 손목 속도 유한차분용 버퍼 (cfg.wrist_vel_finite_diff).
         #   _wrist_fd_seeded: 리셋 직후 첫 obs 는 차분이 무의미하므로 실기와 같이 참값 사용
         self.prev_wrist_pos = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.float32)
@@ -180,13 +193,25 @@ class DrumRobotEnv(DirectRLEnv):
         self.use_case1_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)  # 동시타 배정 (왼팔이 idx0 담당이면 True)
         # 팔별 마지막 실제 타격 스텝 (스케줄러 재장전 시드용). 초기값은 먼 과거 = 시작은 양팔 자유
         self.last_hit_step = torch.full((self.num_envs, 2), -10000, dtype=torch.int64, device=self.device)
-        # 팔별 마지막으로 친 드럼 위치. 스케줄러 배정이 없을 때 ready_pose 대기점 (움직이지 않는 기준)
+        # 팔 상태 (로그와 노는 팔 접근 보상용). 판단은 보상 계산(RewardComputer.compute)이 관측에 있는 값으로 하고 결과를 돌려준다
+        #   arm_state: ARM_STROKE, ARM_PREP, ARM_IDLE(맡은 노트 있음), ARM_FREE(맡은 노트 없음)
+        #   arm_idle:  노는 팔 또는 자유 팔
+        self.arm_state = torch.full((self.num_envs, 2), ARM_FREE, dtype=torch.int64, device=self.device)
+        self.arm_idle = torch.ones((self.num_envs, 2), dtype=torch.bool, device=self.device)
+        # 팔별 마지막으로 친 드럼 위치 (진단용)
         self.last_hit_drum_pos = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
-        # ready_pose 대기점 변화 진단용 직전 값
-        self.prev_home_p = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float32)
+        # 노는 팔 대기점 기준(다음 노트 위치) 변화 진단용 직전 값 (팔별)
+        self.prev_home_p = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=torch.float32)
         # [진단] 배정 변화 측정용 직전 스텝 값
         self.prev_use_left_h0 = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         self.prev_arm_tgt0 = torch.zeros((self.num_envs, 2, 3), device=self.device)
+        # 채점용 담당 팔 기록 (N, T, M). 악보 칸(절대 스텝, 드럼)마다 판정 창이 열리기 직전의 담당 팔 (0=왼, 1=오른, -1=기록 없음).
+        #   한 번 기록하면 바꾸지 않는다. 관측의 배정은 스케줄러가 매 스텝 새로 정하므로 이 기록과 다를 수 있다
+        self.assign_frozen = torch.full((self.num_envs, self.episode_length_step, len(self.instruments.all)), -1,
+                                        dtype=torch.int8, device=self.device)
+        # [진단] 기록된 담당 팔과 지금 관측의 담당 팔이 다른 노트 수 / 기록된 노트 수 (관측 생성 때 세고 다음 보상 때 로그)
+        self.assign_mm_num = torch.zeros(self.num_envs, device=self.device)
+        self.assign_mm_den = torch.zeros(self.num_envs, device=self.device)
 
         # RDS
         self.rds = RDS(
@@ -286,6 +311,11 @@ class DrumRobotEnv(DirectRLEnv):
         per_arm_time = time_norm.new_ones((N, 2, NOTES))                  # 기본 1.0 = 없음/멀리
         per_arm_valid = torch.zeros((N, 2, NOTES), dtype=torch.bool, device=self.device)
         count = torch.zeros((N, 2), dtype=torch.long, device=self.device)
+        # 이벤트별 드럼 담당 팔 (N,K,M). 0=왼, 1=오른, -1=해당 없음 (채점용 기록에 쓴다)
+        ev_arm = torch.full((N, K, M), -1, dtype=torch.int8, device=self.device)
+        arm_left = torch.zeros(N, dtype=torch.int8, device=self.device)
+        arm_right = torch.ones(N, dtype=torch.int8, device=self.device)
+        arm_none = torch.full((N,), -1, dtype=torch.int8, device=self.device)
 
         CROSS = self.cfg.sched_cross_penalty
 
@@ -323,6 +353,17 @@ class DrumRobotEnv(DirectRLEnv):
             # 팔별 이번 이벤트 타겟: 단일 = 담당팔만 p0, 2타 = 양팔 각자 split
             left_gets = (one & choose_left_one) | two
             right_gets = (one & (~choose_left_one)) | two
+            # 이벤트 k 의 드럼별 담당 팔 기록. 단일 = 고른 팔이 idx0, 2타 = A 면 왼팔 idx0 / 오른팔 idx1, B 면 반대.
+            #   2타가 아니면 idx1 자리에 idx0 를 같은 값으로 써서, idx1 이 0 으로 잘린 칸을 덮어쓰지 않게 한다
+            a0 = torch.where(two, torch.where(useA, arm_left, arm_right),
+                             torch.where(choose_left_one, arm_left, arm_right))
+            a1 = torch.where(useA, arm_right, arm_left)
+            i0 = idx0[:, k:k + 1]
+            i1 = torch.where(two, idx1[:, k], idx0[:, k]).unsqueeze(1)
+            ev_k = torch.full((N, M), -1, dtype=torch.int8, device=self.device)
+            ev_k.scatter_(1, i1, torch.where(v, torch.where(two, a1, a0), arm_none).unsqueeze(1))
+            ev_k.scatter_(1, i0, torch.where(v, a0, arm_none).unsqueeze(1))
+            ev_arm[:, k] = ev_k
             left_pos = torch.where(two.unsqueeze(-1), torch.where(useA.unsqueeze(-1), p0, p1), p0)
             right_pos = torch.where(two.unsqueeze(-1), torch.where(useA.unsqueeze(-1), p1, p0), p0)
             for a, gets, gp in ((0, left_gets, left_pos), (1, right_gets, right_pos)):
@@ -339,7 +380,8 @@ class DrumRobotEnv(DirectRLEnv):
             proj[:, 1] = torch.where(right_gets.unsqueeze(-1), right_pos, proj[:, 1])
             free[:, 0] = torch.where(left_gets, new_free, free[:, 0])
             free[:, 1] = torch.where(right_gets, new_free, free[:, 1])
-        return use_left_h0, use_case1_h0, per_arm_pos, per_arm_time, per_arm_valid
+        ev_off = t_step.round().long()                                    # (N,K) 이벤트까지 남은 스텝
+        return use_left_h0, use_case1_h0, per_arm_pos, per_arm_time, per_arm_valid, ev_arm, ev_off
 
     def _get_observations(self) -> dict:
         # 로봇의 관절 위치
@@ -368,8 +410,26 @@ class DrumRobotEnv(DirectRLEnv):
 
         # 팔별 담당 스케줄 (reachability). obs 와 보상 h0 배정(use_left)에 사용.
         # 1스텝 지연으로 다음 _get_rewards 에서 사용 (arm_role 과 동일한 지연)
-        self.use_left_h0, self.use_case1_h0, self.per_arm_pos, self.per_arm_time, self.per_arm_valid = self._compute_arm_schedule(
-            self.next_hits, tip_pos, drum_pos)
+        (self.use_left_h0, self.use_case1_h0, self.per_arm_pos, self.per_arm_time, self.per_arm_valid,
+         ev_arm, ev_off) = self._compute_arm_schedule(self.next_hits, tip_pos, drum_pos)
+
+        # 채점용 담당 팔 기록: 노트까지 W+1 스텝 이하로 처음 들어온 순간의 담당 팔을 적고 이후 바꾸지 않는다.
+        #   관측은 보상 계산 뒤에 만들어지므로 W+1 에서 적어야 판정 창 첫 스텝의 타격도 기록으로 채점된다.
+        #   스케줄러가 그 뒤 배정을 바꿔도 관측만 바뀌고 기록은 그대로다 (그 빈도를 assign_mismatch 로 센다)
+        W = self.hit_window_step
+        T = self.episode_length_step
+        self.assign_mm_num.zero_()
+        self.assign_mm_den.zero_()
+        for k in range(ev_arm.shape[1]):
+            ev = ev_arm[:, k]                                                         # (N,M)
+            open_k = ((ev_off[:, k] <= W + 1) & (self.steps + ev_off[:, k] < T)).unsqueeze(-1)   # (N,1)
+            tau = (self.steps + ev_off[:, k]).clamp(max=T - 1)                        # (N,) 노트의 절대 스텝
+            cur = self.assign_frozen[self._env_arange, tau]                           # (N,M)
+            seen = open_k & (cur >= 0) & (ev >= 0)
+            self.assign_mm_num += (seen & (ev != cur)).float().sum(dim=-1)
+            self.assign_mm_den += seen.float().sum(dim=-1)
+            write = open_k & (cur < 0) & (ev >= 0)
+            self.assign_frozen[self._env_arange, tau] = torch.where(write, ev, cur)
 
         obs = self._normalize_and_pack_obs(
             joint_pos=joint_pos,
@@ -443,28 +503,64 @@ class DrumRobotEnv(DirectRLEnv):
             xy_in_any, xyz_in_any,
         ) = self.hit_detector.detect_hit(tip_pos=tip_pos, drum_pos=self.drum_pos)
 
+        # 담당 팔 확인: 각 드럼의 판정 창(+-W) 안 타겟에 기록된 담당 팔. 타겟이 없거나 기록 전이면 -1 (어느 팔이든 인정).
+        #   같은 드럼의 노트 간격은 2W+1 스텝 이상이라 한 드럼의 +-W 안 타겟은 하나뿐이다
+        N = self.num_envs
+        M = self.drum_pos.shape[1]
+        W = self.hit_window_step
+        T = self.episode_length_step
+        rds = self.rds.get_rds()
+        assigned_now = torch.full((N, M), -1, dtype=torch.int8, device=self.device)
+        for o in range(-W, W + 1):
+            tau = self.steps + o
+            tau_ok = (tau >= 0) & (tau < T)
+            tau_c = tau.clamp(0, T - 1)
+            is_tgt = (rds[self._env_arange, tau_c] > 0) & tau_ok.unsqueeze(-1)                  # (N,M)
+            assigned_now = torch.where(is_tgt, self.assign_frozen[self._env_arange, tau_c], assigned_now)
+        arm_id = torch.arange(2, device=self.device, dtype=torch.int8).view(1, 2, 1)
+        arm_ok = (assigned_now.unsqueeze(1) < 0) | (assigned_now.unsqueeze(1) == arm_id)          # (N,2,M)
+        hit_ok_per_arm = hit_per_arm & arm_ok        # 성공 후보 (담당 팔의 타격)
+        hit_bad_per_arm = hit_per_arm & (~arm_ok)    # 담당 아닌 팔이 판정 창 안 타겟을 침 (오타)
+
         # 관절각, 관절 속도 (손목 각속도 계산 위해 먼저 가져옴)
         robot_pos = self.robot_interface.get_joint_pos(self.robot)
         robot_vel = self.robot_interface.get_joint_vel(self.robot)
         robot_torque = self.robot_interface.get_joint_torque(self.robot)
 
-        # 타격 순간 드럼별 하강 속도 (양팔 중 max)
-        down_vel = torch.clamp(-tip_vel[:, :, 2], 0.0)                         # (N, 2)
-        hit_vel_per_drum = (hit_per_arm.float() * down_vel[:, :, None]).max(dim=1).values  # (N, M)
+        # 리바운드 주입: 팁이 헤드 면을 이번 스텝에 아래로 통과한 팔의 손목 각속도를 -e 배로 반전 (다음 물리 스텝부터 반영).
+        #   트리거는 타격 판정과 독립. 직전 샘플이 면 위, 이번 샘플이 면 아래이면 그 사이에 면을 지난 것이다.
+        #   보상/판정에 쓰는 robot_vel 은 반전 전 값이다 (타격 순간 손목 속도 = 세기)
+        rebound_arm = torch.zeros((self.num_envs, 2), device=self.device, dtype=torch.bool)
+        if self.cfg.rebound_enabled:
+            z_plane = self.drum_pos[:, :, 2] + self.cfg.rebound_plane_offset                       # (N,M) 헤드 면 높이
+            dz_now  = tip_pos[:, :, 2].unsqueeze(-1)      - z_plane.unsqueeze(1)                  # (N,2,M)
+            dz_prev = prev_tip_pos[:, :, 2].unsqueeze(-1) - z_plane.unsqueeze(1)                  # (N,2,M)
+            dxy_sq  = ((tip_pos[:, :, :2].unsqueeze(2) - self.drum_pos[:, :, :2].unsqueeze(1)) ** 2).sum(dim=-1)  # (N,2,M)
+            cross = (dz_prev > 0.0) & (dz_now <= 0.0) & (dxy_sq <= self.cfg.rebound_xy_radius ** 2)  # (N,2,M) 면 통과
+            rebound_arm = cross.any(dim=-1)                                                        # (N,2)
+            if bool(rebound_arm.any()):
+                e_arm = (cross.float() * self.rebound_e_env.unsqueeze(1)).max(dim=-1).values       # (N,2) 통과한 드럼의 e
+                usd_wrist_vel = self.robot.data.joint_vel[:, self.wrist_usd_ids]                   # (N,2) USD 프레임
+                new_wrist_vel = torch.where(rebound_arm, -e_arm * usd_wrist_vel, usd_wrist_vel)
+                self.robot.write_joint_velocity_to_sim(new_wrist_vel, joint_ids=self.wrist_usd_ids)
 
-        # 타격 순간 드럼별 손목 각속도 (양팔 중, 그 드럼 친 팔의 손목)
+        # 타격 순간 드럼별 하강 속도 (담당 팔의 타격 중 max). 세기 평가와 성공 매칭은 담당 팔의 타격만 쓴다
+        down_vel = torch.clamp(-tip_vel[:, :, 2], 0.0)                         # (N, 2)
+        hit_vel_per_drum = (hit_ok_per_arm.float() * down_vel[:, :, None]).max(dim=1).values  # (N, M)
+
+        # 타격 순간 드럼별 손목 각속도 (그 드럼을 친 담당 팔의 손목)
         wrist_vel_abs = robot_vel[:, self.wrist_joint_ids].abs()                # (N, 2)
-        hit_wrist_per_drum = (hit_per_arm.float() * wrist_vel_abs[:, :, None]).max(dim=1).values  # (N, M)
+        hit_wrist_per_drum = (hit_ok_per_arm.float() * wrist_vel_abs[:, :, None]).max(dim=1).values  # (N, M)
 
         # 팔꿈치 리프트: baseline(직전 타격 팔꿈치각) 대비 |현재각|. 스윙 중 apex(최대)를 추적한다
         elbow_angle = robot_pos[:, self.elbow_joint_ids]                        # (N, 2)
         elbow_lift = (elbow_angle - self.elbow_baseline).abs()                  # (N, 2)
         self.elbow_apex_buf = torch.maximum(self.elbow_apex_buf, elbow_lift)    # (N, 2) running max
-        hit_elbow_apex_per_drum = (hit_per_arm.float() * self.elbow_apex_buf[:, :, None]).max(dim=1).values  # (N, M)
+        hit_elbow_apex_per_drum = (hit_ok_per_arm.float() * self.elbow_apex_buf[:, :, None]).max(dim=1).values  # (N, M)
 
-        # 타격 시간/속도/손목각속도/팔꿈치리프트 apex 기록
+        # 타격 시간/속도/손목각속도/팔꿈치리프트 apex 기록 (담당 팔의 타격만 성공 매칭에 쓰인다)
         self.rds.set_rds_visit(
-            steps=self.steps, hit_mask=hit_mask,
+            steps=self.steps, hit_mask=hit_ok_per_arm.any(dim=1),
             hit_vel=hit_vel_per_drum, hit_wrist=hit_wrist_per_drum, hit_elbow_apex=hit_elbow_apex_per_drum,
             xy_in=xy_in_any, xyz_in=xyz_in_any,
         )
@@ -481,7 +577,6 @@ class DrumRobotEnv(DirectRLEnv):
         self.last_hit_drum_pos = torch.where(hit_arm_any.unsqueeze(-1), picked_drum, self.last_hit_drum_pos)
 
         # 결과
-        rds = self.rds.get_rds()
         rds_visit = self.rds.get_rds_visit()
         rds_visit_vel = self.rds.get_rds_visit_vel()
         rds_visit_wrist = self.rds.get_rds_visit_wrist()
@@ -495,7 +590,9 @@ class DrumRobotEnv(DirectRLEnv):
          dir_armed, dir_down, dir_slow, dir_arb,
          reach_near, reach_mid, reach_far,
          zpos_above, zpos_below, zpos_both, zpos_gap) = self.hit_detector.get_result(
-            hit_mask=hit_mask,
+            hit_mask=hit_ok_per_arm.any(dim=1),
+            hit_mask_all=hit_mask,
+            wrong_arm=hit_bad_per_arm.any(dim=1),
             steps=self.steps,
             rds=rds,
             rds_visit=rds_visit,
@@ -512,7 +609,7 @@ class DrumRobotEnv(DirectRLEnv):
         wrist_pos = self.robot_interface.get_wrist_pos(self.robot)  # (N, 2, 3)
         elbow_pos = self.robot_interface.get_elbow_pos(self.robot)  # (N, 2, 3)
 
-        reward, log_terms, rate_log_terms, active_arm = self.reward_computer.compute(
+        reward, log_terms, rate_log_terms, active_arm, arm_state = self.reward_computer.compute(
             success=success,
             wrong_hit=wrong_hit,
             missed_target=missed_target,
@@ -540,19 +637,22 @@ class DrumRobotEnv(DirectRLEnv):
             assigned_use_case1=self.use_case1_h0,
             idle_tgt_pos=self.per_arm_pos[:, :, 0, :],
             idle_tgt_valid=self.per_arm_valid[:, :, 0],
-            idle_tgt_time=self.per_arm_time[:, :, 0],
-            last_drum_pos=self.last_hit_drum_pos,
+            idle_tgt_time=self.per_arm_time[:, :, 0],      # 관측의 팔별 노트 칸과 같은 값 (팔 상태 판정용)
         )
 
-        # 팔별 역할 저장 (다음 스텝 관측에 사용)
+        # 팔 상태: 보상 계산이 관측에 있는 값으로 판정한 결과. 노는 팔 접근 보상과 로그가 같은 판단을 쓴다
+        self.arm_state = arm_state                                                             # (N,2)
+        self.arm_idle = (arm_state == ARM_IDLE) | (arm_state == ARM_FREE)                      # (N,2)
+
+        # 팔별 역할 저장 (다음 스텝 관측에 사용). 다음 노트 담당 팔이며 관측 의미는 그대로
         self.arm_role = active_arm
 
         # 노는 팔 접근(progress) 보상: 자기 담당 다음 드럼으로 팁 거리를 좁힐 때만 (prev_d - curr_d).
-        # per_arm_* 는 직전 _get_observations 에서 계산 (1스텝 지연). active_arm < 0.5 = 노는 팔
+        # per_arm_* 는 직전 _get_observations 에서 계산 (1스텝 지연). 노는 팔은 self.arm_idle
         idle_approach = torch.zeros(self.num_envs, device=self.device)
         for a in range(2):
             tgt = self.per_arm_pos[:, a, 0, :]                                   # (N,3) 그 팔 담당 첫 노트
-            gate = self.per_arm_valid[:, a, 0] & (active_arm[:, a] < 0.5)        # 노는 팔 & 유효 타겟
+            gate = self.per_arm_valid[:, a, 0] & self.arm_idle[:, a]             # 노는 팔 & 유효 타겟
             curr_d = torch.linalg.norm(tip_pos[:, a, :] - tgt, dim=-1)          # (N,)
             prev_d = torch.linalg.norm(prev_tip_pos[:, a, :] - tgt, dim=-1)
             idle_approach = idle_approach + torch.where(gate, prev_d - curr_d, torch.zeros_like(curr_d))
@@ -627,6 +727,8 @@ class DrumRobotEnv(DirectRLEnv):
         rate_log_terms["hit_sh1_sumdev"] = torch.stack([sh1_sum_dev * any_hit, any_hit], dim=-1)
         rate_log_terms["hit_sh1_devL"] = torch.stack([sh1_dev[:, 0] * hL, hL], dim=-1)  # 왼팔 타격 시 왼팔 편차
         rate_log_terms["hit_sh1_devR"] = torch.stack([sh1_dev[:, 1] * hR, hR], dim=-1)  # 오른팔 타격 시 오른팔 편차
+        # [진단] 실제 타격 중 왼팔이 친 비율 (0.5 근처면 양손 균형, 한쪽으로 쏠리면 한손 연주)
+        rate_log_terms["hit_left_share"] = torch.stack([hL, hL + hR], dim=-1)
         # 팔 벌어짐 = sh1_L - sh1_R [deg]. 0 = 둘 다 정면, 음수 = 안쪽으로 모임
         arm_open = sh1_dev[:, 0] - sh1_dev[:, 1]                             # (N,)
         rate_log_terms["hit_arm_open"] = torch.stack([arm_open * any_hit, any_hit], dim=-1)
@@ -640,18 +742,23 @@ class DrumRobotEnv(DirectRLEnv):
         flip = (self.use_left_h0 != self.prev_use_left_h0).float()               # (N,)
         ones_like_flip = torch.ones_like(flip)
         rate_log_terms["assign_flip"] = torch.stack([flip, ones_like_flip], dim=-1)
+        #   assign_ok: 담당 팔이 기록된 판정 창 안 타겟을 친 타격 중 담당 팔이 친 비율
+        has_assign = (assigned_now >= 0).unsqueeze(1)                                        # (N,1,M)
+        rate_log_terms["assign_ok"] = torch.stack([(hit_ok_per_arm & has_assign).float().sum(dim=(1, 2)),
+                                                   (hit_per_arm & has_assign).float().sum(dim=(1, 2))], dim=-1)
+        #   assign_mismatch: 채점용으로 기록된 노트 중 지금 관측의 담당 팔이 기록과 다른 비율 (직전 관측 생성 때 센 값).
+        #   크면 관측과 채점이 자주 어긋난다는 뜻이라 스케줄러가 기록을 따르게 하는 고정이 필요하다
+        rate_log_terms["assign_mismatch"] = torch.stack([self.assign_mm_num, self.assign_mm_den], dim=-1)
         tgt_move = torch.linalg.norm(self.per_arm_pos[:, :, 0, :] - self.prev_arm_tgt0, dim=-1)  # (N,2)
-        idle_valid = (active_arm < 0.5) & self.per_arm_valid[:, :, 0]            # (N,2) 노는 팔 & 유효 타겟
+        idle_valid = self.arm_idle & self.per_arm_valid[:, :, 0]                 # (N,2) 노는 팔 & 유효 타겟
         jumped = ((tgt_move > 0.05) & idle_valid).any(dim=1).float()             # (N,)
         rate_log_terms["idle_tgt_jump"] = torch.stack([jumped, ones_like_flip], dim=-1)
-        # ready_pose 대기점 진단: 스케줄러 배정을 받았나 / 대기점 자체가 튀었나 (배정노트와 마지막친드럼 전환 포함)
-        idle_has = torch.where(self.use_left_h0, self.per_arm_valid[:, 1, 0], self.per_arm_valid[:, 0, 0])
-        sched_p  = torch.where(self.use_left_h0.unsqueeze(-1), self.per_arm_pos[:, 1, 0, :], self.per_arm_pos[:, 0, 0, :])
-        last_p   = torch.where(self.use_left_h0.unsqueeze(-1), self.last_hit_drum_pos[:, 1], self.last_hit_drum_pos[:, 0])
-        home_p   = torch.where(idle_has.unsqueeze(-1), sched_p, last_p)
-        home_move = (torch.linalg.norm(home_p - self.prev_home_p, dim=-1) > 0.05).float()
-        rate_log_terms["idle_has_tgt"]   = torch.stack([idle_has.float(), ones_like_flip], dim=-1)
-        rate_log_terms["idle_home_move"] = torch.stack([home_move, ones_like_flip], dim=-1)
+        # 노는 팔(맡은 노트 있음) 대기점 기준 진단 (팔별, 분모 = 노는 팔 수): 대기점 기준인 다음 노트 위치가 5cm 넘게 바뀌었나.
+        #   대기점이 옮겨 간 비율이며, 이때의 이동은 보상에서 정지 벌점이 거리 조건으로 꺼져 있다
+        idle_note = (self.arm_state == ARM_IDLE)                                 # (N,2)
+        home_p = self.per_arm_pos[:, :, 0, :]                                    # (N,2,3)
+        home_move = ((torch.linalg.norm(home_p - self.prev_home_p, dim=-1) > 0.05) & idle_note).float()   # (N,2)
+        rate_log_terms["idle_home_move"] = torch.stack([home_move.sum(dim=1), idle_note.float().sum(dim=1)], dim=-1)
         self.prev_home_p = home_p.clone()
 
         self.prev_use_left_h0 = self.use_left_h0.clone()
@@ -664,6 +771,10 @@ class DrumRobotEnv(DirectRLEnv):
         exceeded = (over > 1e-3).float()                           # (N,9) 초과 여부
         ones_n = torch.ones(self.num_envs, device=self.device)
         rate_log_terms["lim_exceed_any"] = torch.stack([(exceeded.sum(dim=-1) > 0).float(), ones_n], dim=-1)
+
+        # 리바운드 적용 횟수 (스텝당 팔 수). 면 통과 기준이라 타격 사건 수와 다를 수 있다. 0 에 가까우면 정책이 면까지 안 내려가는 것
+        if self.cfg.rebound_enabled:
+            rate_log_terms["rebound_applied"] = torch.stack([rebound_arm.float().sum(dim=1), ones_n], dim=-1)
 
         # 로그 출력
         self.logger.add(log_terms)
@@ -709,6 +820,11 @@ class DrumRobotEnv(DirectRLEnv):
                     device=self.device, dtype=torch.long,
                 )
 
+        # 리바운드 반발계수 DR (env 별 재추첨)
+        if self.cfg.rebound_enabled and self.cfg.rebound_e_jitter > 0.0:
+            _j = (torch.rand((len(env_ids), 1), device=self.device) * 2.0 - 1.0) * self.cfg.rebound_e_jitter
+            self.rebound_e_env[env_ids] = (self.rebound_e.unsqueeze(0) + _j).clamp(0.0, 1.0)
+
         # tip 리셋
         tip_pos = self.robot_interface.get_body_pos(self.robot)
         self.hit_detector.reset(env_ids=env_ids, tip_pos=tip_pos)
@@ -720,7 +836,9 @@ class DrumRobotEnv(DirectRLEnv):
         self.use_left_h0[env_ids] = True   # 스케줄러 h0 배정 초기화
         self.use_case1_h0[env_ids] = True
         self.last_hit_step[env_ids] = -10000   # 재장전 상태 초기화 (시작은 자유)
-        # 대기점 시드: 시작 자세(드럼 위 hover)를 그대로 대기점으로 (에피소드 초반 ready_pose 과도현상 방지)
+        self.arm_state[env_ids] = ARM_FREE     # 팔 상태 로그용 초기화 (첫 보상 계산에서 다시 판정됨)
+        self.arm_idle[env_ids] = True
+        # 마지막 친 드럼 시드: 시작 자세(드럼 위 hover) 아래 드럼 높이 (진단용)
         seed_drum = tip_pos[env_ids].clone()
         seed_drum[:, :, 2] = seed_drum[:, :, 2] - self.reward_computer.cfg.ready_height
         self.last_hit_drum_pos[env_ids] = seed_drum
@@ -745,12 +863,13 @@ class DrumRobotEnv(DirectRLEnv):
             return self.cfg.eval_midi_ratio
 
         # 성공률(EMA) 기반: start 전엔 순수 랜덤, start~full 선형 증가, 그 뒤 final 고정.
-        # reward_computer 가 유지하는 전체 성공률 EMA 사용. MIDI 가 성공률을 끌어내리면 비율도 자동 감소
+        # 래치: 한 번 올라간 비율은 성공률이 떨어져도 내려가지 않는다 (악보 분포가 성공률을 따라 흔들리지 않게)
         ema = self.reward_computer.success_ema
         start = self.cfg.midi_success_start
         frac = (ema - start) / max(1e-6, self.cfg.midi_success_full - start)
         frac = min(max(frac, 0.0), 1.0)
-        return self.cfg.midi_final_ratio * frac
+        self.midi_frac_latch = max(getattr(self, "midi_frac_latch", 0.0), frac)
+        return self.cfg.midi_final_ratio * self.midi_frac_latch
 
     """ init """
     def _init_obs(self):
@@ -874,6 +993,11 @@ class DrumRobotEnv(DirectRLEnv):
     def _reset_tensors(self, env_ids: torch.Tensor):
         # 스텝 리셋
         self.steps[env_ids] = 0
+
+        # 채점용 담당 팔 기록 리셋 (새 악보)
+        self.assign_frozen[env_ids] = -1
+        self.assign_mm_num[env_ids] = 0.0
+        self.assign_mm_den[env_ids] = 0.0
 
         # 팔별 역할 리셋 (에피소드 시작 시 stale 값 방지)
         self.arm_role[env_ids] = 0.0

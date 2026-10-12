@@ -14,4 +14,7 @@ outputs/
 
 # Local-only
 MIDIs/
+MIDIs_train/
+*.mid
+*.midi
 Phil-drum-robot/

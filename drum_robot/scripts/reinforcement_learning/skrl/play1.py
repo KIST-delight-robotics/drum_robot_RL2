@@ -73,6 +73,12 @@ parser.add_argument("--wrist_fd", action="store_true", default=False,
                          "같은 체크포인트로 켜고/끄고 두 번 돌린 성공률 차이 = 이 채널의 배포 갭")
 parser.add_argument("--random_drums", action="store_true", default=False,
                     help="드럼 위치 랜덤화(DR) 유지. 기본(play1)은 실기 위치로 고정(drum_noise_scale=0)")
+parser.add_argument("--rebound", type=float, nargs="?", const=-1.0, default=None,
+                    help="리바운드 주입 켜기. 값 없이 주면 cfg 의 드럼/심벌 e 사용, 값을 주면 모든 드럼에 그 e 적용. "
+                         "현재 정책이 실기 반발을 처음 겪을 때의 반응을 본다")
+parser.add_argument("--fill_empty_home", action="store_true", default=False,
+                    help="관측의 팔별 빈 슬롯(배정 노트 없음)을 원점 대신 그 팔의 마지막 타격 드럼 위치로 채운다. "
+                         "보상과 배정은 그대로이고 관측만 바뀐다")
 parser.add_argument("--log_every", type=int, default=300,
                     help="play1 로그 flush 주기(스텝). 짧게 하면 곡 안 끝나도 로그가 자주 뜸. 0=곡 1회마다(mode3)")
 
@@ -220,6 +226,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
     env_cfg.wrist_vel_finite_diff = args_cli.wrist_fd   # [sim2real 점검] 손목 속도 유한차분 A/B
     if args_cli.slow_factor is not None:
         env_cfg.eval_slow_factor = args_cli.slow_factor   # 원곡 템포 테스트용 override (1.0 등)
+    if args_cli.rebound is not None:
+        env_cfg.rebound_enabled = True
+        if args_cli.rebound >= 0.0:                        # 값을 주면 전 드럼 공통 e
+            env_cfg.rebound_e_drum = args_cli.rebound
+            env_cfg.rebound_e_cymbal = args_cli.rebound
+        print(f"[PLAY1] rebound ON: e_drum={env_cfg.rebound_e_drum} e_cymbal={env_cfg.rebound_e_cymbal}")
 
     # ===== export: '지정한 곡 전체 연주'를 뽑는 용도 → full-song(mode 3)으로 맞춘다 =====
     #   midi_file 이 있으면 그 곡 전체를 처음부터 끝까지 재생한 궤적이 CSV로 저장된다.
@@ -403,6 +415,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, expe
         print("[PLAY1] 드럼 위치 = 실기 고정 (drum_noise_scale=0, DR 끔). --random_drums 로 랜덤화 유지 가능")
     else:
         print(f"[PLAY1] 드럼 위치 = 랜덤화 유지 (drum_noise_scale={env.unwrapped.instruments.drum_noise_scale})")
+
+    # 관측의 빈 슬롯을 그 팔의 대기점(마지막 타격 드럼)으로 채운다. 관측 함수만 감싸므로 보상과 배정은 그대로
+    if args_cli.fill_empty_home:
+        _fb = env.unwrapped
+        _orig_pack = _fb._normalize_and_pack_obs
+
+        def _pack_fill_home(**kw):
+            pos = kw["per_arm_pos"]                                     # (N,2,NOTES,3)
+            valid = _fb.per_arm_valid.unsqueeze(-1)                     # (N,2,NOTES,1)
+            home = _fb.last_hit_drum_pos.unsqueeze(2).expand_as(pos)    # (N,2,NOTES,3)
+            kw["per_arm_pos"] = torch.where(valid, pos, home)
+            return _orig_pack(**kw)
+
+        _fb._normalize_and_pack_obs = _pack_fill_home
+        print("[PLAY1] fill_empty_home ON: 빈 슬롯 = 마지막 타격 드럼 위치")
 
     # reset environment
     obs, _ = env.reset()

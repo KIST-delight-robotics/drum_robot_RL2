@@ -17,6 +17,7 @@ from tqdm import tqdm   # type: ignore
 class LoggerCfg:
     interval: int = 2000              # n step마다 출력
     sample_env_id: Optional[int] = None  # None: 전체 mean, 정수: 특정 env만
+    groups: tuple = ()                # 출력 순서: 묶음(키 튜플)을 차례로, 묶음 사이는 ' ‖ ', 묶음에 없는 키는 맨 뒤
 
 
 class EnvLogger:
@@ -88,7 +89,7 @@ class EnvLogger:
 
         # value 출력
         keys = self._sum.keys()
-        parts = []
+        texts = {}
 
         for k in keys:
             avg_env = self._sum[k] / denom  # (N,)
@@ -96,24 +97,32 @@ class EnvLogger:
                 val = avg_env.mean()
             else:
                 val = avg_env[int(self.cfg.sample_env_id)]
-            parts.append(f"{k}={val.item():.3f}")
+            texts[k] = f"{k}={val.item():.3f}"
 
         # probability 출력
         p_keys = self._p_sum.keys()
-        p_parts = []
 
         for k in p_keys:
             p_sum = self._p_sum[k]  # (N,2)
             num = p_sum[:,0].sum() / denom
             den = p_sum[:,1].sum() / denom
-            p_parts.append(f"{k}={num/(den+1e-6):.3f}")
+            texts[k] = f"{k}={num/(den+1e-6):.3f}"
 
         head = f"\n[STEP {self.step}]"
         if prefix:
             head += f" {prefix}"
 
-        all_parts = parts + p_parts
-        tqdm.write(head + " " + " | ".join(all_parts))
+        # 묶음 순서대로 출력, 묶음에 없는 키는 맨 뒤
+        segs, used = [], set()
+        for group in self.cfg.groups:
+            g = [texts[k] for k in group if k in texts]
+            used.update(group)
+            if g:
+                segs.append(" | ".join(g))
+        rest = [v for k, v in texts.items() if k not in used]
+        if rest:
+            segs.append(" | ".join(rest))
+        tqdm.write(head + " " + " ‖ ".join(segs))
 
         # window reset
         for v in self._sum.values():

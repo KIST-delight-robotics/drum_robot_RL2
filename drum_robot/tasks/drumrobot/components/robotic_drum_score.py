@@ -46,7 +46,7 @@ GENERAL_MIDI_PERCUSSION_KEY_MAP = {
 
 @dataclass
 class RDSCfg:
-    midi_folder_path: str = "/home/shy/RL_workspace/IsaacLab/source/extensions/drum_robot/drum_robot/MIDIs"
+    midi_folder_path: str = str(Path(__file__).resolve().parents[3] / "MIDIs")   # drum_robot/MIDIs
 
     slow_factor: float = 1.5        # slow_factor=2 -> 0.5배속 / slow_factor=0.5 -> 2배속
     start_offset_steps: int = 20
@@ -94,6 +94,12 @@ class RDSCfg:
     max_lookahead_s: float = 1.0    # 최대 관측 범위 (초)
     num_hits: int = 3               # 최대 관측 타격 개수
 
+    # 무작위 악보 (템포 + 16분음표 격자)
+    rand_bpm_range: tuple = (70.0, 130.0)           # 에피소드마다 템포 [BPM]
+    rand_gap_units: tuple = (1, 2, 3, 4)            # 다음 음표까지 간격
+    rand_gap_probs: tuple = (0.4, 0.3, 0.15, 0.15)  # 각 간격이 나올 확률
+    rand_repeat_prob: float = 0.3                   # 직전과 같은 드럼을 다시 칠 확률 (전체 분포는 8개 균등 유지)
+
 class RDS:
     def __init__(
             self,
@@ -123,7 +129,6 @@ class RDS:
         M = self.num_drums
 
         self.rds = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
-        self.rds_visit = torch.zeros((N, T, M), device=self.device, dtype=torch.bool)
 
         # util
         self.env_arange = torch.arange(self.env.num_envs, device=self.device)
@@ -199,14 +204,8 @@ class RDS:
 
         return next_hits
     
-    def set_rds_visit(self, steps: torch.Tensor, hit_mask: torch.Tensor):
-        self.rds_visit[self.env_arange, steps, :] = hit_mask    # 타격한 시간에 방문 처리
-
     def get_rds(self) -> torch.Tensor:
         return self.rds
-    
-    def get_rds_visit(self) -> torch.Tensor:
-        return self.rds_visit
 
     def reset(self, env_ids: torch.Tensor, score_ratio: float=0.5, selection_strength: float=0.5):
         N = len(env_ids)
@@ -235,7 +234,6 @@ class RDS:
         # reset
         robotic_drum_score = torch.cat(outputs, dim=0)
         self.rds[env_ids] = robotic_drum_score
-        self.rds_visit[env_ids] = False
 
     # ===== INIT =====
     def _glob_midi_files(self) -> list:
@@ -420,37 +418,37 @@ class RDS:
         return self.rds_dataset[idx]
 
     def _reset_random(self, env_ids: torch.Tensor) -> torch.Tensor:
-        N = len(env_ids)
-        T = self.env.episode_length_step
-        M = self.num_drums
+        # 무작위 악보: 에피소드마다 템포를 고르고, 16분음표 격자 위에 간격(칸 수)을 무작위로 이어 붙임
+        #   가장 짧은 간격 = 최고 템포의 16분음표 1칸 (130 BPM -> 115 ms)
+        #   드럼: 직전 드럼 반복(rand_repeat_prob) 또는 나머지 7개 중 균등 -> 전체 분포는 8개 균등
+        cfg = self.cfg
+        N, T, M = len(env_ids), self.env.episode_length_step, self.num_drums
+        dt, dev = self.env.step_dt, self.device
+        s = cfg.start_offset_steps
+        e = T - self.env.hit_window_step                                            # 끝 매칭 범위만큼은 비움
 
-        rds_rand = torch.zeros((N, T, M), device=self.device, dtype=torch.int64)
+        # 1) 템포 -> 16분음표 한 칸 길이 [s]
+        lo, hi = cfg.rand_bpm_range
+        unit_s = 60.0 / (lo + (hi - lo) * torch.rand(N, device=dev)) / 4           # (N,)
 
-        s = self.cfg.start_offset_steps
-        e = T - self.env.hit_window_step
+        # 2) 간격: 칸 수를 확률표에서 뽑아 이어 붙임
+        K = int((e - s) * dt / (60.0 / hi / 4)) + 1                                 # 가장 촘촘할 때 들어가는 음표 수
+        units = torch.tensor(cfg.rand_gap_units, device=dev, dtype=torch.float32)
+        probs = torch.tensor(cfg.rand_gap_probs, device=dev)
+        g = units[torch.multinomial(probs, N * K, replacement=True).view(N, K)]     # (N, K) 칸 수
+        cum = torch.cumsum(g, dim=1) - g[:, :1] * torch.rand(N, 1, device=dev)      # 첫 음 시각도 에피소드마다 다르게
+        t = s + torch.round(cum * unit_s[:, None] / dt).long()                      # (N, K) 음표 스텝
+        valid = t < e
 
-        k = 10
-        ### 윈도우 겹침 문제 해결 - 새로운 변수 정의############################
-        W = self.env.hit_window_step
-        min_gap = 2*W+1
-        hit_zone_width = max(1, (e - s - (k - 1) * min_gap) // k)
-        #################################################################
+        # 3) 드럼
+        drum = torch.empty((N, K), dtype=torch.long, device=dev)
+        drum[:, 0] = torch.randint(0, M, (N,), device=dev)
+        for k in range(1, K):
+            other = (drum[:, k - 1] + torch.randint(1, M, (N,), device=dev)) % M   # 직전과 다른 7개 중 균등
+            repeat = torch.rand(N, device=dev) < cfg.rand_repeat_prob
+            drum[:, k] = torch.where(repeat, drum[:, k - 1], other)
 
-        for i in range(k):
-            #si = (int)(s + (2 * i) * (e - s) / (2 * k - 1))
-            #ei = (int)(s + (2 * i + 1) * (e - s) / (2 * k - 1)) 
-            #time_rand = torch.randint(si, ei, (N,), device=self.device) #기존코드
-
-            ###########################윈도우 겹침 문제 해결###########################
-            si = s + i * (hit_zone_width + min_gap)
-            ei = si + hit_zone_width
-            if ei > e:
-                break
-            time_rand = torch.randint(si, max(si + 1, ei), (N,), device=self.device)
-            ########################################################################
-
-            drum_rand = torch.randint(0, M, (N,), device=self.device)
-
-            rds_rand[torch.arange(N), time_rand, drum_rand] = 1
-
+        rds_rand = torch.zeros((N, T, M), device=dev, dtype=torch.int64)
+        n_idx = torch.arange(N, device=dev)[:, None].expand(N, K)
+        rds_rand[n_idx[valid], t[valid], drum[valid]] = 1
         return rds_rand

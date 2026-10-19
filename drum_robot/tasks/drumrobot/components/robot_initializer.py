@@ -87,8 +87,16 @@ class RobotInitializer:
             name = self.ctrl_joint_names[i]
             idx = self.robot.joint_name_to_ik_result_idx[name]
             self.pos_angle[:, i] = out[:, idx]
-    
-    def reset_init_pos(self, env_ids: torch.Tensor) -> torch.Tensor:
+
+        # 드럼 쌍 이름 -> 드럼 번호 (Instruments 순서), 시작 자세 드럼을 알려주기 위해
+        names = list(inst_by_name.keys())
+        self.pair_drum_idx = torch.tensor(
+            [[names.index(l_name), names.index(r_name)] for l_name, r_name in self.cfg.drum_pairs],
+            device=self.device,
+            dtype=torch.long,
+        )   # (N, 2) [왼손, 오른손]
+
+    def reset_init_pos(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         N = len(self.cfg.drum_pairs)
 
         rand = torch.randint(0, N, (len(env_ids),), device=self.device)
@@ -96,4 +104,4 @@ class RobotInitializer:
         init_pos = self.pos_angle[rand, :]
         init_pos = init_pos + self.cfg.joint_noise_scale * torch.randn_like(init_pos)
 
-        return init_pos
+        return init_pos, self.pair_drum_idx[rand]   # (n, 9) 시작 관절각, (n, 2) 시작 자세 드럼 [왼손, 오른손]

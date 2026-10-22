@@ -38,7 +38,7 @@ class StickingPlannerCfg:
     step_dt: float = 0.015          # 정책 주기 [s]
     gamma: float = 1.0              # 미래 이벤트 할인율
     lambda_m: float = 1.0           # C_mech 배율
-    lambda_r: float = 2.0           # C_role 배율
+    lambda_r: float = 5.0           # C_role 배율 (2 -> 5: 손 선호를 거리·속도보다 크게)
 
     # C_mech
     w_d: float = 1.0
@@ -62,7 +62,7 @@ class StickingPlannerCfg:
         "crash_l": (0.1, 0.1),
     })
 
-    commit_lead_s: float = 0.20     # 타격까지 이 시간 이하면 배정 확정 [s]
+    commit_lead_s: float = 1     # 타격까지 이 시간 이하면 배정 확정 [s]
     num_notes: int = 2              # per_arm_* 의 팔별 노트 칸 수 (env 의 sched_notes)
 
 
@@ -226,8 +226,11 @@ class StickingPlanner:
         since = (steps.long().unsqueeze(1) - last_hit_step.long()).clamp(min=0)
         bits, breakdown = self.solve(next_hits, tip_pos, tip_vel, drum_pos, since, fixed)
 
-        # 확정: 타격까지 commit_lead_s 이하이고 아직 미확정인 이벤트
-        to_commit = (slot < self.T) & (fixed < 0) & (ev_off.float() * cfg.step_dt <= cfg.commit_lead_s)
+        # 확정: 다가오는 첫 번째 이벤트, 또는 타격까지 commit_lead_s 이하인 이벤트 (아직 미확정이면)
+        first = torch.zeros_like(valid)
+        first[:, 0] = True                                                        # next_hits는 가까운 순서라 0번이 첫 음표
+        near = ev_off.float() * cfg.step_dt <= cfg.commit_lead_s
+        to_commit = (slot < self.T) & (fixed < 0) & (first | near)
         cur = self.commit.gather(1, slot)
         self.commit.scatter_(1, slot, torch.where(to_commit, bits.to(torch.int8), cur))
         self.commit[:, self.T] = -1

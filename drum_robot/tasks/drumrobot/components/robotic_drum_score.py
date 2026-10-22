@@ -92,7 +92,7 @@ class RDSCfg:
 
     # 타격 관측
     max_lookahead_s: float = 1.0    # 최대 관측 범위 (초)
-    num_hits: int = 3               # 최대 관측 타격 개수
+    num_hits: int = 6               # 최대 관측 타격 개수
 
     # 무작위 악보 (템포 + 16분음표 격자)
     rand_bpm_range: tuple = (70.0, 130.0)           # 에피소드마다 템포 [BPM]

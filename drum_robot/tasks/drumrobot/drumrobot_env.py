@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch                                                    # pyright: ignore[reportMissingImports]
 import torch.nn.functional as F                                 # pyright: ignore[reportMissingImports]
 from typing import Sequence
+import math
 
 import numpy as np                                              # pyright: ignore[reportMissingImports]
 import gymnasium as gym                                         # pyright: ignore[reportMissingImports]
@@ -18,7 +19,7 @@ from .drumrobot_cfg import DrumRobotEnvCfg
 from .components.specs import EnvRuntimeSpec, Instruments, RobotSpec
 from .components.robot_interface import RobotInterface
 from .components.robotic_drum_score import RDSCfg, RDS
-from .components.hit_detector import HitDetector, HitDetectorCfg, HitResult
+from .components.hit_detector import HitDetector, HitDetectorCfg
 from .components.reward import RewardComputer, RewardCfg
 from .components.robot_initializer import RobotInitializerCfg, RobotInitializer
 from .components.sticking_planner import StickingPlanner, StickingPlannerCfg
@@ -120,11 +121,15 @@ class DrumRobotEnv(DirectRLEnv):
             self.robot.data.joint_effort_limits[0, ctrl_joint_ids] / self.robot.data.joint_stiffness[0, ctrl_joint_ids]
         ).unsqueeze(0)  # (1, 9)
         self.target_q = torch.zeros((N, len(ctrl_joint_names)), device=self.device)   # 누적 목표 (로봇 좌표계)
+        # 정렬만 학습: 허리·어깨 yaw 외 관절은 행동 0으로 고정 (= 목표 유지, 시작 자세 그대로)
+        self.frozen_ids = [i for i, name in enumerate(ctrl_joint_names)
+                           if name not in ("waist_joint", "left_shoulder_1", "right_shoulder_1")]
 
         # 실제 접촉 지점이 스틱 끝에서 떨어진 거리 (팁/몸통 구분용), 물리 스텝마다 기록
         # 센서는 마지막 물리 스텝의 접촉 지점만 주므로 _apply_action에서 앞 물리 스텝 것을 받아 둠
         robot_spec = RobotSpec()
         self.wrist_body_ids = [self.robot_interface.body_to_idx["left_wrist"], self.robot_interface.body_to_idx["right_wrist"]]
+        self.shoulder_body_ids = [self.robot_interface.body_to_idx["left_shoulder_2"], self.robot_interface.body_to_idx["right_shoulder_2"]]   # 어깨 pitch 관절 = 위팔 시작점 (도달 벌)
         self.stick_tip_x = torch.tensor(
             [robot_spec.tip_offset_left[0], robot_spec.tip_offset_right[0]], device=self.device
         ).view(1, 2, 1)                                                         # 손목 링크 x축(스틱 축) 위 스틱 끝 [m]
@@ -138,16 +143,15 @@ class DrumRobotEnv(DirectRLEnv):
             ctrl_joint_names=ctrl_joint_names,
         )
 
-        # 보상 (모든 보상 항은 reward.py에서 관리)
+        # 보상 (허리·어깨 정렬 + 도달, reward.py)
         self.reward_computer = RewardComputer(
             device=self.device,
             cfg=RewardCfg(),
             env=env_specs,
             joint_names=ctrl_joint_names,
-            num_actions=self.cfg.action_space,
         )
 
-        # 손 배정 (스티킹 플래너): 손별 다음 음표 -> 판정(담당 손), 정렬·접근 보상, 관측
+        # 손 배정 (스티킹 플래너): 손별 다음 음표 -> 가상 타격의 담당 손, 정렬 보상, 관측
         self.planner = StickingPlanner(
             cfg=StickingPlannerCfg(step_dt=self.step_dt),
             drum_names=list(self.instruments.all.keys()),
@@ -177,12 +181,10 @@ class DrumRobotEnv(DirectRLEnv):
                 sample_env_id=0,
                 groups=(
                     ("rew_total",),                                                                 # 총 보상
-                    ("match_rate", "matched", "rew_hit", "rew_pos", "rew_height", "wrist_lift_deg",  # 성공
-                     "within_20ms", "mean_abs_err_ms", "tip_ratio"),
-                    ("rew_align", "rew_prox", "align_waist_err_deg", "align_yaw_err_deg", "prox_dist_cm"),  # 유도
-                    ("wrong", "rew_wrong", "wrong_per_hit", "wrong_arm", "bad", "rew_bad"),        # 잘못 침
-                    ("missed", "rew_miss"),                                                         # 놓침
-                ),                                                                                  # 나머지(hits, 정규화 등)는 맨 뒤
+                    ("rew_align", "align_waist_err_deg", "align_yaw_err_deg"),                     # 정렬
+                    ("rew_act_rate",),                                                              # 행동 변화 (모든 관절)
+                    ("rew_reach",),                                                                 # 도달
+                ),
             ),
         )
 
@@ -228,11 +230,12 @@ class DrumRobotEnv(DirectRLEnv):
         # 다음 타격
         self.next_hits = self.rds.get_next_hits(self.steps)
 
-        # 손별 다음 음표 (플래너 배정): 드럼 one-hot (없으면 0) + 남은 시간 (없으면 1)
+        # 손별 목표 드럼 (정렬 항과 같음: 다음 음표 드럼, 없으면 그 손이 직전에 친 드럼) one-hot + 남은 시간 (없으면 1)
         M = drum_pos.shape[1]
-        arm_next = torch.cat(
-            [F.one_hot(self.arm_drum, M).float() * self.arm_valid[..., None], self.arm_t[..., None]], dim=-1
-        )   # (N, 2, M+1)
+        al = self.reward_computer.alignment
+        arm_target = torch.stack([al.target_l, al.target_r], dim=1)                 # (N, 2) [왼손, 오른손]
+        arm_next = torch.cat([F.one_hot(arm_target, M).float(), self.arm_t[..., None]], dim=-1)   # (N, 2, M+1)
+        align_err = al.signed_errors(joint_pos, drum_pos) / math.pi                 # (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw], -1 ~ 1
 
         obs = self._normalize_and_pack_obs(
             joint_pos=joint_pos,
@@ -242,6 +245,7 @@ class DrumRobotEnv(DirectRLEnv):
             drum_pos=drum_pos,
             next_hits=self.next_hits,
             arm_next=arm_next,
+            align_err=align_err,
             )
         
         if torch.isnan(obs).any():
@@ -255,6 +259,9 @@ class DrumRobotEnv(DirectRLEnv):
 
         # action 범위를 [-1, 1]로 강제
         actions = torch.clamp(actions, -1.0, 1.0)
+
+        # 정렬만 학습: 허리·어깨 yaw 외 관절은 행동 0 (= 목표 유지, 시작 자세 그대로)
+        actions[:, self.frozen_ids] = 0.0
 
         # 로봇 위치 가져오기
         robot_q = self.robot_interface.get_joint_pos(self.robot)
@@ -294,46 +301,38 @@ class DrumRobotEnv(DirectRLEnv):
         return died, time_out
 
     def _get_rewards(self) -> torch.Tensor:
-        # 타격 판정 (정상 타격 / 잘못된 접촉, 팁/몸통 기록) + 악보 매칭
-        contact_force = self._get_drum_contact_force()              # (N, D, 2, M, 3)
-        self.contact_from_tip[:, -1] = self._get_contact_from_tip() # 마지막 물리 스텝 접촉 지점
-        tip_pos = self.robot_interface.get_body_pos(self.robot)     # (N, 2, 3)
-        result = self.hit_detector.step(
-            contact_force=contact_force,
-            contact_from_tip=self.contact_from_tip,
-            steps=self.steps,
-        )
+        # 정렬만 학습: 실제 타격 판정 대신 가상 타격 (음표 시각에 플래너가 배정한 손이 쳤다고 간주)
+        tip_pos = self.robot_interface.get_body_pos(self.robot)                                # (N, 2, 3) 플래너 입력
+        virtual = self._virtual_hits()                                                          # (N, 2, M)
 
-        # 손 배정: 이번 스텝 타격까지 반영한 뒤 플래너 실행 -> 손별 다음 음표, 판정의 목표별 담당 손
+        # 손 배정: 이번 스텝 (가상) 타격까지 반영한 뒤 플래너 실행 -> 손별 다음 음표, 목표별 담당 손
         next_hits = self.rds.get_next_hits(self.steps)
-        hit_arm = result.hit_per_arm.any(dim=-1)                                                # (N, 2)
-        self.last_hit_step = torch.where(hit_arm, self.steps[:, None].expand(-1, 2), self.last_hit_step)
+        self.last_hit_step = torch.where(virtual.any(dim=-1), self.steps[:, None].expand(-1, 2), self.last_hit_step)
         plan = self.planner.schedule(self.steps, next_hits, tip_pos, self._get_tip_velocity(), self.drum_pos, self.last_hit_step)
         ev_arm, ev_off = plan[5], plan[6]
-        self.hit_detector.set_target_arm(self.steps, ev_arm, ev_off)                           # 다음 스텝부터 판정에 사용
+        self.hit_detector.set_target_arm(self.steps, ev_arm, ev_off)                           # 다음 음표들의 담당 손 (가상 타격에 사용)
         self.arm_drum, self.arm_t, self.arm_valid = self._arm_next_notes(ev_arm, next_hits)
 
-        # 보상
+        # 보상: 허리·어깨 정렬 + 도달
         joint_pos = self.robot_interface.get_joint_pos(self.robot)
+        shoulder_pos = self.robot.data.body_pos_w[:, self.shoulder_body_ids] - self.scene.env_origins[:, None]   # (N, 2, 3) env 좌표 (드럼 위치와 같은 좌표)
         reward, reward_log = self.reward_computer.compute(
-            result=result,
+            hit_per_arm=virtual,
             joint_pos=joint_pos,
-            tip_pos=tip_pos,
             drum_pos=self.drum_pos,
             arm_drum=self.arm_drum,
             arm_t=self.arm_t,
             arm_valid=self.arm_valid,
             actions=self.actions,
-            steps=self.steps,
-            global_step=self.common_step_counter,
+            shoulder_pos=shoulder_pos,
         )
 
         # 로그 출력
-        self._log_hit_result(result, extra_terms=reward_log)
+        self.logger.add(reward_log)
         self.logger.maybe_flush()
 
-        # 시각화 (타격 표시, 드럼 색상 변경)
-        self.visualizer.step(tip_pos=tip_pos, next_hits=self.next_hits, hit_per_arm=result.hit_per_arm)
+        # 시각화 (가상 타격 표시, 드럼 색상 변경)
+        self.visualizer.step(tip_pos=tip_pos, next_hits=self.next_hits, hit_per_arm=virtual)
 
         if torch.isnan(reward).any():
             raise RuntimeError("NaN reward")
@@ -397,11 +396,12 @@ class DrumRobotEnv(DirectRLEnv):
         self.obs_dim_drum      = M * 3                 # 드럼 * xyz
         self.obs_dim_next      = K * (M + 2)           # lookahead K개 * (one-hot M + time + valid)
         self.obs_dim_arm       = 2 * (M + 1)           # 손별 다음 음표 (플래너 배정): 드럼 one-hot M + 남은 시간
+        self.obs_dim_align     = 3                     # 정렬 오차 (허리, 오른 yaw, 왼 yaw)
 
         obs_dim_total = (
             self.obs_dim_joint_pos + self.obs_dim_joint_vel + self.obs_dim_lead
             + self.obs_dim_tip + self.obs_dim_drum
-            + self.obs_dim_next + self.obs_dim_arm
+            + self.obs_dim_next + self.obs_dim_arm + self.obs_dim_align
         )
 
         if obs_dim_total != self.cfg.observation_space:
@@ -460,12 +460,14 @@ class DrumRobotEnv(DirectRLEnv):
             drum_pos: torch.Tensor,
             next_hits: torch.Tensor,
             arm_next: torch.Tensor,
+            align_err: torch.Tensor,
         ) -> torch.Tensor:
         # joint_pos, joint_vel, lead: (N, 9)
         # tip_pos: (N, 2, 3)
         # drum_pos: (N, M, 3)
         # next_hits: (N, K, M+2)
         # arm_next: (N, 2, M+1) 손별 다음 음표 (이미 0~1)
+        # align_err: (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw] (이미 -1~1)
 
         # normalize
         joint_pos_n = (joint_pos - self.joint_center) / self.joint_half_range
@@ -491,6 +493,7 @@ class DrumRobotEnv(DirectRLEnv):
                 drum_pos_n.reshape(self.num_envs, self.obs_dim_drum),
                 next_hits.reshape(self.num_envs, self.obs_dim_next),
                 arm_next.reshape(self.num_envs, self.obs_dim_arm),
+                align_err,
             ],
             dim=-1
         )
@@ -498,15 +501,6 @@ class DrumRobotEnv(DirectRLEnv):
         return obs
 
     """ func (_get_rewards) """
-    def _get_drum_contact_force(self) -> torch.Tensor:
-        # 스틱이 드럼에서 받은 힘 벡터 (N, D, 2, M, 3) [N], 2 = [왼손, 오른손]
-        # D = 정책 스텝 안의 물리 스텝 수 (센서 history_length), 시간 순 (0이 가장 이른 물리 스텝)
-        # contact_offset 안에 들어와도 실제로 닿기 전에는 힘이 0이므로 힘으로 판정
-        # 윗면을 위에서 치면 z가 + (드럼이 스틱을 위로 밀어냄), 밑면이면 -
-        fL = self.contact_L.data.force_matrix_w_history[:, :, 0]   # (N, D, M, 3), 0이 가장 최근
-        fR = self.contact_R.data.force_matrix_w_history[:, :, 0]
-        return torch.stack([fL, fR], dim=2).flip(1)
-
     def _get_contact_from_tip(self) -> torch.Tensor:
         # 마지막 물리 스텝의 실제 접촉 지점이 스틱 끝에서 떨어진 거리 (N, 2, M) [m], 접촉 없으면 NaN
         # 접촉 지점을 그 순간의 손목 링크 좌표로 바꾸면 x = 스틱 축 위치 -> 스틱 끝(tip_offset x)까지 거리
@@ -540,33 +534,14 @@ class DrumRobotEnv(DirectRLEnv):
                 valid[:, a] |= has
         return drum, t, valid
 
-    def _log_hit_result(self, r: HitResult, extra_terms: dict | None = None):
-        # 타격·매칭 결과 로그 (학습 진행 확인용) + 보상 항 로그(extra_terms)
-        # logger.add는 스텝마다 한 번만 호출해야 평균이 맞아서 한 번에 넘김
-        n_hit = r.hit_per_arm.any(dim=1).float().sum(-1)                   # (N,) 이번 스텝 타격 수
-        n_matched = r.matched.float().sum(-1)
-        n_wrong = r.wrong_hit.float().sum(-1)
-        n_missed = r.missed.float().sum(-1)
-        n_bad = r.bad_contact.float().sum(-1)                               # 잘못된 접촉 (밑면·옆면)
-        n_wrong_arm = r.wrong_arm.float().sum(-1)                           # 잘못 침 중 담당이 아닌 손으로 친 것
-        n_arm_hit = r.hit_per_arm.float().sum(dim=(1, 2))                   # 손별로 센 정상 타격 수
-        n_tip = r.tip_per_arm.float().sum(dim=(1, 2))                       # 그중 팁으로 친 수
-        abs_err_ms = (r.time_error.abs() * 1000.0 * r.matched).sum(-1)
-        n_within = ((r.time_error.abs() <= 0.02) & r.matched).float().sum(-1)
-
-        terms = {"hits": n_hit, "matched": n_matched, "wrong": n_wrong, "wrong_arm": n_wrong_arm, "missed": n_missed, "bad": n_bad}
-        extra_terms = extra_terms or {}
-        terms.update({k: v for k, v in extra_terms.items() if v.ndim == 1})       # 값 항 (N,)
-        ratios = {k: v for k, v in extra_terms.items() if v.ndim == 2}            # 비율 항 (N, 2) [분자, 분모]
-        self.logger.add(terms)
-        self.logger.add_probability({
-            "match_rate": torch.stack([n_matched, n_matched + n_missed], dim=-1),   # 판정 끝난 목표 중 맞힌 비율
-            "wrong_per_hit": torch.stack([n_wrong, n_hit], dim=-1),               # 타격 중 잘못 친 비율
-            "within_20ms": torch.stack([n_within, n_matched], dim=-1),            # 맞힌 것 중 |오차| <= 20ms 비율
-            "mean_abs_err_ms": torch.stack([abs_err_ms, n_matched], dim=-1),      # 평균 |시간 오차| [ms]
-            "tip_ratio": torch.stack([n_tip, n_arm_hit], dim=-1),                 # 정상 타격 중 팁(끝 반구)으로 친 비율 (몸통 타격 확인용)
-            **ratios,
-        })
+    def _virtual_hits(self) -> torch.Tensor:
+        # 가상 타격: 이번 스텝 음표를 플래너가 확정한 담당 손이 쳤다고 간주 -> (N, 2, M) [왼손, 오른손]
+        # (정렬만 학습: 실제로 치지 않아도 손별 직전 드럼, 마지막 타격 시각이 실제 연주 순서대로 바뀌게)
+        det, ar = self.hit_detector, self.hit_detector.env_arange
+        s = self.steps.clamp(max=self.episode_length_step - 1)
+        owner = det.target_arm[ar, s].long()                                   # (N, M) 담당 손 (플래너가 0.2초 전에 확정)
+        owner = torch.where(owner < 0, torch.ones_like(owner), owner)         # 미배정이면 오른손 (실제로는 안 생김)
+        return det.target[ar, s][:, None] & (owner[:, None] == det.arm_idx)
 
     """ func (_reset_idx) """
     def _reset_drum(self, env_ids: torch.Tensor):

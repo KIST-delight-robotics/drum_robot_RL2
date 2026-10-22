@@ -57,7 +57,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     decimation: int = 2             # 정책(Policy) 업데이트 한 번당 시뮬레이션 스텝 수
     episode_length_s: float = 5.0   # 에피소드 최대 길이 (초)
     action_space: int = 9           # 로봇 제어 차원
-    observation_space: int = 105    # 관측 차원 (관절 9 + 관절속도 9 + 목표 앞섬 9 + 팁 6 + 드럼 24 + 다음 타격 30 + 손별 다음 음표 18)
+    observation_space: int = 138    # 관측 차원 (관절 9 + 관절속도 9 + 목표 앞섬 9 + 팁 6 + 드럼 24 + 다음 타격 60 + 손별 다음 음표 18 + 정렬 오차 3)
     state_space: int = 0
 
     # 행동 -> 관절 목표: 목표 = 직전 목표 + a x scale x step_dt (직전 목표에 누적)

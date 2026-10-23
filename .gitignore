@@ -4,13 +4,15 @@ __pycache__/
 
 # Python build artifacts
 *.egg-info/
-*.pyc
 
-# Logs
+# 학습 결과 (체크포인트, tensorboard, play CSV)
 logs/
 
-# Outputs
+# Hydra 출력
 outputs/
 
-# Local-only
-MIDIs/TABLE.bin
+# Local-only (git에 올리지 않음)
+# drum_robot/MIDIs/: MIDI 1150개 (어느 깊이의 MIDIs 폴더든 무시)
+MIDIs/
+# TABLE.bin: 150 MB, GitHub 파일 제한(100 MB) 초과 (어느 위치든 무시)
+TABLE.bin

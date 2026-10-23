@@ -38,7 +38,7 @@ class StickingPlannerCfg:
     step_dt: float = 0.015          # 정책 주기 [s]
     gamma: float = 1.0              # 미래 이벤트 할인율
     lambda_m: float = 1.0           # C_mech 배율
-    lambda_r: float = 5.0           # C_role 배율 (2 -> 5: 손 선호를 거리·속도보다 크게)
+    lambda_r: float = 2.0           # C_role 배율
 
     # C_mech
     w_d: float = 1.0
@@ -62,7 +62,7 @@ class StickingPlannerCfg:
         "crash_l": (0.1, 0.1),
     })
 
-    commit_lead_s: float = 1     # 타격까지 이 시간 이하면 배정 확정 [s]
+    commit_lead_s: float = 0.20     # 타격까지 이 시간 이하면 배정 확정 [s]
     num_notes: int = 2              # per_arm_* 의 팔별 노트 칸 수 (env 의 sched_notes)
 
 

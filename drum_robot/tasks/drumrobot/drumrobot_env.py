@@ -129,7 +129,7 @@ class DrumRobotEnv(DirectRLEnv):
         # 센서는 마지막 물리 스텝의 접촉 지점만 주므로 _apply_action에서 앞 물리 스텝 것을 받아 둠
         robot_spec = RobotSpec()
         self.wrist_body_ids = [self.robot_interface.body_to_idx["left_wrist"], self.robot_interface.body_to_idx["right_wrist"]]
-        self.shoulder_body_ids = [self.robot_interface.body_to_idx["left_shoulder_2"], self.robot_interface.body_to_idx["right_shoulder_2"]]   # 어깨 pitch 관절 = 위팔 시작점 (도달 벌)
+        self.shoulder_body_ids = [self.robot_interface.body_to_idx["left_shoulder_2"], self.robot_interface.body_to_idx["right_shoulder_2"]]   # 어깨 pitch 관절 = 위팔 시작점 (허리 목표의 거리 조건)
         self.stick_tip_x = torch.tensor(
             [robot_spec.tip_offset_left[0], robot_spec.tip_offset_right[0]], device=self.device
         ).view(1, 2, 1)                                                         # 손목 링크 x축(스틱 축) 위 스틱 끝 [m]
@@ -143,12 +143,15 @@ class DrumRobotEnv(DirectRLEnv):
             ctrl_joint_names=ctrl_joint_names,
         )
 
-        # 보상 (허리·어깨 정렬 + 도달, reward.py)
+        # 보상 (허리·어깨 정렬, reward.py): 허리 목표의 거리 조건에 어깨 높이가 필요 (허리·yaw 회전과 무관한 상수)
+        shoulder_z = (self.robot.data.body_pos_w[0, self.shoulder_body_ids, 2] - self.scene.env_origins[0, 2]).mean().item()
+        print(f"[DrumRobotEnv] 어깨 높이 z_S = {shoulder_z:.3f} m (env 좌표)")
         self.reward_computer = RewardComputer(
             device=self.device,
             cfg=RewardCfg(),
             env=env_specs,
             joint_names=ctrl_joint_names,
+            shoulder_z=shoulder_z,
         )
 
         # 손 배정 (스티킹 플래너): 손별 다음 음표 -> 가상 타격의 담당 손, 정렬 보상, 관측
@@ -183,7 +186,6 @@ class DrumRobotEnv(DirectRLEnv):
                     ("rew_total",),                                                                 # 총 보상
                     ("rew_align", "align_waist_err_deg", "align_yaw_err_deg"),                     # 정렬
                     ("rew_act_rate",),                                                              # 행동 변화 (모든 관절)
-                    ("rew_reach",),                                                                 # 도달
                 ),
             ),
         )
@@ -313,9 +315,8 @@ class DrumRobotEnv(DirectRLEnv):
         self.hit_detector.set_target_arm(self.steps, ev_arm, ev_off)                           # 다음 음표들의 담당 손 (가상 타격에 사용)
         self.arm_drum, self.arm_t, self.arm_valid = self._arm_next_notes(ev_arm, next_hits)
 
-        # 보상: 허리·어깨 정렬 + 도달
+        # 보상: 허리·어깨 정렬
         joint_pos = self.robot_interface.get_joint_pos(self.robot)
-        shoulder_pos = self.robot.data.body_pos_w[:, self.shoulder_body_ids] - self.scene.env_origins[:, None]   # (N, 2, 3) env 좌표 (드럼 위치와 같은 좌표)
         reward, reward_log = self.reward_computer.compute(
             hit_per_arm=virtual,
             joint_pos=joint_pos,
@@ -324,7 +325,6 @@ class DrumRobotEnv(DirectRLEnv):
             arm_t=self.arm_t,
             arm_valid=self.arm_valid,
             actions=self.actions,
-            shoulder_pos=shoulder_pos,
         )
 
         # 로그 출력

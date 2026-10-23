@@ -1,14 +1,14 @@
 """
-보상 계산 (허리·어깨 정렬 + 도달, 타격 없이 학습하는 실험)
+보상 계산 (허리·어깨 정렬, 타격 없이 학습하는 실험)
 
 정렬    w_align × (허리·어깨 yaw 정렬)
         손별 목표 드럼 = 스티킹 플래너가 배정한 그 손의 다음 음표 (배정 없으면 그 손이 직전에 친 드럼)
         직전 드럼은 가상 타격(음표 시각에 담당 손이 쳤다고 간주)으로 갱신 (drumrobot_env._virtual_hits)
+        목표 허리 = (두 팔이 드럼을 향할 수 있음 ∩ 두 손 다 d ≤ d_th) 인 허리 중 식 (6) L 최소
+                    교집합이 없으면 방향 가능한 허리 중 넘은 거리² 합 최소 (별도의 도달 벌은 없음)
+        d = 어깨(허리 축에서 l, 높이 shoulder_z) -> 그 손의 목표 드럼 직선거리, d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
 행동 변화 (모든 관절)
         -w_act_rate × Σ_j (a_j,t - a_j,t-1)²   (행동 = 목표 속도라서 변화량 = 가속, 고정 관절은 행동이 0이라 0)
-도달    -w_reach × Σ ((d - d_th) / σ)²   (d > d_th 인 손만, 두 손 모두: 쉬는 손은 직전에 친 드럼)
-        d = 어깨 pitch 관절(위팔 시작점) -> 그 손이 칠 드럼 직선거리, d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
-        σ = reach_scale (문턱부터 실제로 닿는 한계 약 0.76 m 까지 여유) -> 무차원, 한계에 닿으면 1
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from .specs import EnvRuntimeSpec, Instruments, RobotSpec
 # 정렬 보상 (허리·어깨 yaw): 다음 타격 드럼 쪽으로 허리와 어깨 yaw를 정렬
 #   손별 목표 드럼 = 스티킹 플래너가 배정한 그 손의 다음 음표 (배정 없으면 그 손이 직전에 친 드럼)
 #   목표 허리 θ0* = (오른손 드럼, 왼손 드럼) 쌍에서 식 (6) L = w1·cos(q1 + q2) + w2·cos(2π(q0 - q0,min) / (q0,max - q0,min)) 최소
+#       후보 허리 = 방향 가능 (q1, q2 관절 범위 안) ∩ 두 손 다 어깨 -> 드럼 거리 ≤ d_th, q0,min ~ q0,max = 그 범위의 양 끝
 #       θ1* = atan2(y1 - l·sin q0, x1 - l·cos q0) - q0      오른손 목표 드럼 (x1, y1)
 #       θ2* = atan2(y2 + l·sin q0, x2 + l·cos q0) - q0      왼손 목표 드럼 (x2, y2)
 #   보상 -exp(-k_time·t) × [w_waist·|q0 - θ0*| + w_yaw·(|q1 - θ1*| + |q2 - θ2*|)]
@@ -38,6 +39,7 @@ class AlignmentRewardCfg:
     w2: float = 1.0                 # 식 (6) 둘째 항: 허리가 범위 가운데에 가깝게
     k_time: float = 0.0             # 시간 가중 exp(-k_time × t)
     waist_step_deg: float = 0.5     # 허리 훑는 간격 [deg]
+    reach_ratio: float = 0.75       # 거리 문턱 d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
 
 class AlignmentReward:
     def __init__(
@@ -46,12 +48,16 @@ class AlignmentReward:
             cfg: AlignmentRewardCfg,
             env: EnvRuntimeSpec,
             joint_names: list,
+            shoulder_z: float,
     ):
         self.device = device
         self.cfg = cfg
 
         spec = RobotSpec()
         self.l = spec.part_length.waist / 2                     # 허리 축 -> 어깨 [m]
+        pl = spec.part_length
+        self.d_th = cfg.reach_ratio * (pl.upper_arm + pl.lower_arm + pl.stick)     # 거리 문턱 [m] (0.75 × 0.803 = 0.602)
+        self.z_s = shoulder_z                                   # 어깨 높이 [m] (env 좌표, 어깨 pitch 관절)
         self.r_lim = spec.joint_limit["right_shoulder_1"]       # 오른쪽 어깨 yaw 제한 [rad]
         self.l_lim = spec.joint_limit["left_shoulder_1"]        # 왼쪽 어깨 yaw 제한 [rad]
         w_lo, w_hi = spec.joint_limit["waist_joint"]
@@ -66,7 +72,7 @@ class AlignmentReward:
         N, M = env.num_envs, len(Instruments().all)
         self.M = M
         self.pair_waist = torch.zeros((N, M, M), device=device)                     # [env, 오른손 드럼 i, 왼손 드럼 j] -> θ0*
-        self.pair_cost = torch.full((N, M, M), float("inf"), device=device)         # -> 최소 L (배정 불가면 inf)
+        self.pair_cost = torch.full((N, M, M), float("inf"), device=device)         # -> 고른 허리의 점수 (방향부터 불가면 inf)
         self.prev_drum = torch.zeros((N, 2), device=device, dtype=torch.long)       # 손별 직전 드럼 [왼손, 오른손]
         self.target_r = torch.zeros(N, device=device, dtype=torch.long)             # 현재 목표 드럼 (오른손)
         self.target_l = torch.zeros(N, device=device, dtype=torch.long)             # 현재 목표 드럼 (왼손)
@@ -76,10 +82,10 @@ class AlignmentReward:
     def reset(self, env_ids: torch.Tensor, drum_pos: torch.Tensor, init_drum: torch.Tensor):
         # drum_pos:  (N, M, 3) 환경 좌표 (x, y는 IK 좌표와 같음)
         # init_drum: (n, 2) 시작 자세 드럼 [왼손, 오른손]
-        xy = drum_pos[env_ids, :, :2]
+        p = drum_pos[env_ids]                # (n, M, 3) 높이차까지 쓰므로 x, y, z
         for i in range(self.M):             # 오른손 드럼
             for j in range(self.M):         # 왼손 드럼
-                waist, cost = self._solve_waist(xy[:, i], xy[:, j])
+                waist, cost = self._solve_waist(p[:, i], p[:, j])
                 self.pair_waist[env_ids, i, j] = waist
                 self.pair_cost[env_ids, i, j] = cost
 
@@ -147,11 +153,21 @@ class AlignmentReward:
                             self._wrap(th2 - q2)], dim=1)
 
     def _solve_waist(self, pR: torch.Tensor, pL: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # pR, pL: (n, 2) 오른손·왼손 목표 드럼 x, y -> (θ0*, 최소 L), 가능한 허리가 없으면 L = inf
+        # pR, pL: (n, 3) 오른손·왼손 목표 드럼 x, y, z -> (θ0*, 점수), 방향부터 가능한 허리가 없으면 점수 = inf
+        # 목표 허리 = 방향 가능 ∩ 두 손 다 거리 ≤ d_th (교집합 B) 중 L 최소. B가 없으면 방향 가능한 허리 중 넘은 거리² 합 최소
         th = self.waist_grid[None, :]                                               # (1, G)
         q1 = self._wrap_yaw(torch.atan2(pR[:, 1:2] - self.l * torch.sin(th), pR[:, 0:1] - self.l * torch.cos(th)) - th)
         q2 = self._wrap_yaw(torch.atan2(pL[:, 1:2] + self.l * torch.sin(th), pL[:, 0:1] + self.l * torch.cos(th)) - th)
-        ok = (q1 >= self.r_lim[0]) & (q1 <= self.r_lim[1]) & (q2 >= self.l_lim[0]) & (q2 <= self.l_lim[1])  # (n, G)
+        ok_yaw = (q1 >= self.r_lim[0]) & (q1 <= self.r_lim[1]) & (q2 >= self.l_lim[0]) & (q2 <= self.l_lim[1])  # (n, G) 방향 가능
+
+        # 어깨 -> 드럼 거리 (어깨: 허리 축에서 l, 높이 z_s)
+        dR = torch.sqrt((pR[:, 0:1] - self.l * torch.cos(th)) ** 2 + (pR[:, 1:2] - self.l * torch.sin(th)) ** 2
+                        + (pR[:, 2:3] - self.z_s) ** 2)                            # (n, G)
+        dL = torch.sqrt((pL[:, 0:1] + self.l * torch.cos(th)) ** 2 + (pL[:, 1:2] + self.l * torch.sin(th)) ** 2
+                        + (pL[:, 2:3] - self.z_s) ** 2)
+        ok_all = ok_yaw & (dR <= self.d_th) & (dL <= self.d_th)                     # (n, G) 교집합 B
+        has_all = ok_all.any(dim=1, keepdim=True)
+        ok = torch.where(has_all, ok_all, ok_yaw)                                   # B가 없으면 방향 가능 범위
 
         # 허리 범위 = 가능한 첫 허리 ~ 마지막 허리 (실제 로봇 서버와 같은 방식)
         G = th.shape[1]
@@ -163,10 +179,12 @@ class AlignmentReward:
         span = (self.waist_grid[hi.clamp(min=0)][:, None] - q0_min).clamp(min=1e-6)
 
         L = self.cfg.w1 * torch.cos(q1 + q2) + self.cfg.w2 * torch.cos(2 * math.pi * (th - q0_min) / span)
-        L = torch.where(ok, L, torch.full_like(L, float("inf")))
-        k = L.argmin(dim=1)
-        L_min = L.gather(1, k[:, None]).squeeze(1)
-        return self.waist_grid[k], torch.where(valid, L_min, torch.full_like(L_min, float("inf")))
+        over2 = (dR - self.d_th).clamp(min=0.0) ** 2 + (dL - self.d_th).clamp(min=0.0) ** 2   # 넘은 거리² 합
+        score = torch.where(has_all, L, over2)                                      # B가 있으면 L, 없으면 덜 넘는 곳
+        score = torch.where(ok, score, torch.full_like(score, float("inf")))
+        k = score.argmin(dim=1)
+        s_min = score.gather(1, k[:, None]).squeeze(1)
+        return self.waist_grid[k], torch.where(valid, s_min, torch.full_like(s_min, float("inf")))
 
     @staticmethod
     def _wrap(a: torch.Tensor) -> torch.Tensor:
@@ -180,7 +198,7 @@ class AlignmentReward:
 
 
 # ============================================================
-# 전체 보상 (정렬 + 도달)
+# 전체 보상 (정렬)
 # ============================================================
 @dataclass
 class RewardCfg:
@@ -188,9 +206,6 @@ class RewardCfg:
     align: AlignmentRewardCfg = field(default_factory=AlignmentRewardCfg)
     w_act_rate: float = 0.1                 # 행동 변화(가속) 비용, 모든 관절에 같은 가중치: 클수록 관절이 서서히 출발·정지
                                             # (관절 하나당 w_act_rate / w_align = 0.5: 허리만 쓰던 값과 같음)
-    w_reach: float = 0.3                    # 도달 벌: -w_reach × (넘은 양 / σ)², 실제로 닿는 한계(넘은 양 = σ)에서의 벌
-    reach_ratio: float = 0.75               # 문턱 d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
-    reach_scale: float = 0.16               # 무차원화 기준 σ [m]: 문턱 0.602 m -> 실제로 닿는 한계 약 0.76 m 까지의 여유
 
 
 class RewardComputer:
@@ -200,14 +215,11 @@ class RewardComputer:
             cfg: RewardCfg,
             env: EnvRuntimeSpec,
             joint_names: list,
+            shoulder_z: float,
     ):
         self.cfg = cfg
-        self.alignment = AlignmentReward(device, cfg.align, env, joint_names)
+        self.alignment = AlignmentReward(device, cfg.align, env, joint_names, shoulder_z)
         self.prev_a = torch.zeros((env.num_envs, len(joint_names)), device=device)  # 직전 스텝 행동 (행동 변화 비용용)
-        pl = RobotSpec().part_length
-        L_max = pl.upper_arm + pl.lower_arm + pl.stick                             # 팔 최대 길이 [m] (0.803)
-        self.d_th = cfg.reach_ratio * L_max                                         # 도달 문턱 [m] (0.75 × 0.803 = 0.602)
-        self.reach_scale = cfg.reach_scale                                          # 무차원화 기준 σ [m] (문턱 -> 실제 한계 여유, 0.16)
 
     def reset(self, env_ids: torch.Tensor, drum_pos: torch.Tensor, init_drum: torch.Tensor):
         self.alignment.reset(env_ids=env_ids, drum_pos=drum_pos, init_drum=init_drum)
@@ -222,7 +234,6 @@ class RewardComputer:
             arm_t: torch.Tensor,
             arm_valid: torch.Tensor,
             actions: torch.Tensor,
-            shoulder_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         # hit_per_arm: (N, 2, M) 이번 스텝 타격 (가상 타격) -> 손별 직전 드럼 갱신용
         # joint_pos:   (N, 9) 로봇 좌표계 관절각
@@ -231,7 +242,6 @@ class RewardComputer:
         # arm_t:       (N, 2) 손별 다음 음표까지 남은 시간 (0~1, 없으면 1)
         # arm_valid:   (N, 2) 손별 다음 음표 있음
         # actions:     (N, 9) 이번 스텝 행동 (-1 ~ 1, = 관절 목표 속도 / 배율)
-        # shoulder_pos:(N, 2, 3) 어깨 pitch 관절(위팔 시작점) 위치 [왼손, 오른손] (env 좌표)
         align, align_log = self.alignment.compute(
             joint_pos=joint_pos,
             drum_pos=drum_pos,
@@ -246,20 +256,11 @@ class RewardComputer:
         r_act_rate = -self.cfg.w_act_rate * ((actions - self.prev_a) ** 2).sum(dim=-1)
         self.prev_a = actions.clone()
 
-        # 도달 벌: 어깨 -> 목표 드럼 직선거리가 문턱 d_th를 넘은 양을 여유 σ로 나눈 값의 제곱 (두 손 모두, 쉬는 손은 직전에 친 드럼)
-        al = self.alignment
-        target = torch.stack([al.target_l, al.target_r], dim=1)                     # (N, 2) 정렬 항이 방금 정한 목표 드럼 [왼손, 오른손]
-        hit_pos = drum_pos[al.env_arange[:, None], target]                           # (N, 2, 3) 그 드럼의 타격점
-        dist = (hit_pos - shoulder_pos).norm(dim=-1)                                 # (N, 2) √(Δx² + Δy² + Δz²)
-        over = (dist - self.d_th).clamp(min=0.0)                                     # 문턱 안이면 0
-        r_reach = -self.cfg.w_reach * ((over / self.reach_scale) ** 2).sum(dim=-1)
-
-        reward = r_align + r_act_rate + r_reach
+        reward = r_align + r_act_rate
         log_terms = {
             "rew_total": reward,
             "rew_align": r_align,
             "rew_act_rate": r_act_rate,
-            "rew_reach": r_reach,
             **align_log,
         }
         return reward, log_terms

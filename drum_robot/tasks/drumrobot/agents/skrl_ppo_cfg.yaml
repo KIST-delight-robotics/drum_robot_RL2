@@ -48,7 +48,7 @@ agent:
   value_loss_scale: 1.0 #2.0
   kl_threshold: 0.0
   rewards_shaper_scale: 1.0 #0.1
-  time_limit_bootstrap: False
+  time_limit_bootstrap: True
   # logging and checkpoint
   experiment:
     directory: "drum_robot"
@@ -58,5 +58,5 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 1000000 #1000000
+  timesteps: 300000 #1000000
   environment_info: log

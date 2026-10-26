@@ -24,6 +24,7 @@
         RL_desired − output (주황) : 추종 오차 (관절이 정책 명령을 따라가지 못한 만큼)
         제목: 평균 |오차|, 치기 직전(가장 가까운 음표까지 0.1초 이하) 평균 |오차|
     세로선: 음표 시각 (파랑 = 왼손, 빨강 = 오른손)
+    y 눈금 (각도 칸, 위치 오차 칸): 5° 간격 격자. 숫자는 겹치지 않게 칸 높이에 맞춰 5° / 10° / 20° / 50°마다 (확대하면 5°마다)
 """
 
 import argparse
@@ -33,6 +34,7 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 # matplotlib 기본 단축키와 겹치는 키 해제 (← / → / v 는 이 스크립트에서 씀)
 for _k, _keys in (("keymap.back", ("left", "c")), ("keymap.forward", ("right", "v"))):
@@ -133,6 +135,20 @@ def note_lines(ax, d: dict):
                 ax.axvline(x, color=color, alpha=0.35, lw=1)
 
 
+def deg_ticks(ax):
+    # 각도 칸 y 눈금: 5° 간격 격자, 숫자는 보이는 범위와 칸 높이에 맞춰 겹치지 않는 간격으로 (그릴 때마다 다시 정함)
+    ax.yaxis.set_major_locator(MultipleLocator(5))
+
+    def fmt(y, _):
+        lo, hi = ax.get_ylim()
+        room = max(2.0, ax.get_window_extent().height / 14)            # 숫자 하나에 약 14 px
+        every = next((s for s in (5, 10, 20, 50) if (hi - lo) / s <= room), 100)
+        return f"{y:.0f}" if round(y) % every == 0 else ""
+
+    ax.yaxis.set_major_formatter(FuncFormatter(fmt))
+    ax.tick_params(axis="y", labelsize=8)
+
+
 def draw(fig, ax_main, ax_err, path: Path, i: int, n: int, mode: str, lim: dict):
     d = load_cached(path)
     t = d["t"]
@@ -163,6 +179,8 @@ def draw(fig, ax_main, ax_err, path: Path, i: int, n: int, mode: str, lim: dict)
         note_lines(ax, d)
         ax.grid(alpha=0.3)
         ax.set_ylim(*lim[(mode, k)])
+        if mode == "angle":
+            deg_ticks(ax)
 
         # 작은 칸: 위치 오차 (항상)
         ax = ax_err[k]
@@ -179,6 +197,7 @@ def draw(fig, ax_main, ax_err, path: Path, i: int, n: int, mode: str, lim: dict)
         ax.set_title(f"{title.split()[0]}  position error   {text}  deg", fontsize=9)
         ax.grid(alpha=0.3)
         ax.set_ylim(*lim[("error", k)])
+        deg_ticks(ax)
 
     ax_main[0].set_xlim(*lim["x"])
     ax_main[0].legend(loc="upper right", fontsize=8)

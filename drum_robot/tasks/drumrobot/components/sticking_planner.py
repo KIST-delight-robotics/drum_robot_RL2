@@ -38,31 +38,31 @@ class StickingPlannerCfg:
     step_dt: float = 0.015          # 정책 주기 [s]
     gamma: float = 1.0              # 미래 이벤트 할인율
     lambda_m: float = 1.0           # C_mech 배율
-    lambda_r: float = 2.0           # C_role 배율
+    lambda_r: float = 1.0           # C_role 배율
 
     # C_mech
-    w_d: float = 1.0
+    w_d: float = 0.69431
     d_ref: float = 0.30             # 이 거리에서 C_d = 1 [m]
-    w_v: float = 1.0
+    w_v: float = 7.74303
     v_ref: float = 2.0              # 속도 차이가 이 값이면 C_v = 1 [m/s]
-    w_rearm: float = 3.0
-    t_rearm_s: float = 0.25         # 재타격 기준 간격 [s]. 기존 t_rearm(7 스텝 = 0.105s)은 판정상 최소 간격이라 그보다 넓게 둔다.
+    w_rearm: float = 14.66093
+    t_rearm_s: float = 0.33795         # 재타격 기준 간격 [s]. 기존 t_rearm(7 스텝 = 0.105s)은 판정상 최소 간격이라 그보다 넓게 둔다.
                                     #   이 값과 w_rearm 이 교대로 바뀌는 간격을 정한다 (기본값에서 약 120ms 는 교대, 195ms 는 한 손)
     dt_eps_s: float = 0.015         # 남은 시간 하한 [s] (0 나누기 방지, 1 스텝)
 
     # C_role: 악기별 (왼손 비용, 오른손 비용). 프로젝트 악기 이름 기준
     role_cost: dict = field(default_factory=lambda: {
-        "hihat":   (0.8, 0.0),
-        "snare":   (0.0, 0.5),
-        "ride":    (0.9, 0.0),
-        "high":    (0.2, 0.2),
-        "mid":     (0.2, 0.2),
-        "floor":   (0.3, 0.1),
-        "crash_r": (0.1, 0.1),      # 표의 Crash 를 양쪽 크래시에 같은 값으로
-        "crash_l": (0.1, 0.1),
-    })
+        "hihat":   (4.0,    0.0),
+        "snare":   (0.0,    2.9124),
+        "ride":    (2.358,  0.0),
+        "high":    (0.0,    1.9517),
+        "mid":     (2.4203, 0.0),
+        "floor":   (3.0,    0.0),
+        "crash_r": (0.1148, 0.0),
+        "crash_l": (1.3407, 0.0),
+    },)
 
-    commit_lead_s: float = 0.20     # 타격까지 이 시간 이하면 배정 확정 [s]
+    commit_lead_s: float = 0.26061     # 타격까지 이 시간 이하면 배정 확정 [s]
     num_notes: int = 2              # per_arm_* 의 팔별 노트 칸 수 (env 의 sched_notes)
 
 

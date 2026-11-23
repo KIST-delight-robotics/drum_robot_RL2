@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: OBSERVATIONS
-        layers: [256, 160, 128] #[512, 256, 128]
+        layers: [256, 160, 128] 
         activations: elu
     output: ONE # value_dim=1
 
@@ -58,5 +58,6 @@ agent:
 
 trainer:
   class: SequentialTrainer
-  timesteps: 300000 #1000000
+  # timesteps: 250000 #1000000
+  timesteps: 500000 #1000000
   environment_info: log

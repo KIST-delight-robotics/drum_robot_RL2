@@ -2,18 +2,20 @@
 [확인용 임시 모듈] play_align.py, play_song.py 공통: 매 스텝 env 0번의 허리·어깨 yaw 기록, CSV 저장, 요약
 
 기록 (θ0 허리, θ1 오른 어깨 yaw, θ2 왼 어깨 yaw)
-    desired    : 정렬 보상의 목표 (허리 = 쌍 표, 어깨 yaw = 같은 식으로 다시 계산: θ1* = atan2(y_R - l·sin q0, x_R - l·cos q0) - q0, 왼쪽은 부호 반대)
+    desired    : 정렬 보상의 목표 (허리 = 쌍 표, 어깨 yaw = 같은 식으로 다시 계산: θ1* = atan2(y_R - l·sin θ0*, x_R - l·cos θ0*) - θ0*, 왼쪽은 부호 반대. 보상과 같이 목표 허리 θ0* 기준)
     RL_desired : 정책이 명령한 관절 목표 env.target_q (행동 = 목표 속도를 누적, 실제 ± max_lead 안으로 자름)
     output     : 실제 관절 각도
     + 손별 다음 음표(드럼, 남은 시간), 이번 스텝 가상 타격
+    + 보상 항 (스텝당, env가 계산한 값 그대로): rew_align, rew_act_rate, rew_vel, vel_gate (속도 벌 켜짐 1 / 꺼짐 0)
 환경의 _get_rewards 뒤에 붙여서 기록 (환경 코드는 그대로)
 """
 
 import math
 
+REW_KEYS = ["rew_align", "rew_act_rate", "rew_vel", "vel_gate"]     # reward.py RewardComputer.compute 의 로그 키
 COLS = ["t", "waist_tgt", "waist_act", "yaw_r_tgt", "yaw_r_act", "yaw_l_tgt", "yaw_l_act",
         "note_l", "note_l_s", "note_r", "note_r_s", "hit_l", "hit_r",
-        "waist_cmd", "yaw_r_cmd", "yaw_l_cmd"]
+        "waist_cmd", "yaw_r_cmd", "yaw_l_cmd"] + REW_KEYS + ["waist_ref"]
 
 
 class AlignRecorder:
@@ -33,6 +35,15 @@ class AlignRecorder:
         self.tag = tag
         self.rows = []
         self.prev_step = -1
+
+        # 보상 항: compute 가 돌려주는 env별 로그를 잡아둠 (extras["log"]는 env 평균이라 안 씀)
+        self.rew_log = {}
+        orig_compute = env.reward_computer.compute
+        def compute(*args, **kwargs):
+            reward, log = orig_compute(*args, **kwargs)
+            self.rew_log = log
+            return reward, log
+        env.reward_computer.compute = compute
 
         orig = env._get_rewards
         def _get_rewards():
@@ -60,9 +71,14 @@ class AlignRecorder:
         q0, q1, q2 = q[al.j_waist].item(), q[al.j_r].item(), q[al.j_l].item()
         pR = env.drum_pos[0, al.target_r[0], :2].tolist()
         pL = env.drum_pos[0, al.target_l[0], :2].tolist()
+        w = al.target_waist[0].item()                                        # θ0* (보상 reward.py:137 과 같은 허리 기준)
+        # th1 = math.atan2(pR[1] - al.l * math.sin(w), pR[0] - al.l * math.cos(w)) - w
+        # th2 = math.atan2(pL[1] + al.l * math.sin(w), pL[0] + al.l * math.cos(w)) - w
         th1 = math.atan2(pR[1] - al.l * math.sin(q0), pR[0] - al.l * math.cos(q0)) - q0
         th2 = math.atan2(pL[1] + al.l * math.sin(q0), pL[0] + al.l * math.cos(q0)) - q0
-        waist_tgt = self._near(al.target_waist[0].item(), q0)
+        waist_tgt = self._near(w, q0)
+        ref = getattr(al, "ref_waist", None)
+        waist_ref = self._near(ref[0].item(), q0) if ref is not None else float("nan")
         cmd = env.target_q[0]                                                # 정책이 명령한 관절 목표 (RL)
         c0, c1, c2 = cmd[al.j_waist].item(), cmd[al.j_r].item(), cmd[al.j_l].item()
 
@@ -70,12 +86,13 @@ class AlignRecorder:
         drum = env.arm_drum[0].tolist()
         t_s = (env.arm_t[0] * self.horizon_s).tolist()
         hit = env._virtual_hits()[0].any(dim=-1).tolist()                 # [왼손, 오른손] 이번 스텝 가상 타격
+        rew = [self.rew_log[k][0].item() if k in self.rew_log else float("nan") for k in REW_KEYS]   # env 0번 보상 항 (없는 키는 nan)
 
         row = [step * self.dt, waist_tgt, q0, self._near(th1, q1), q1, self._near(th2, q2), q2,
                drum[0] if valid[0] else -1, t_s[0] if valid[0] else float("nan"),
                drum[1] if valid[1] else -1, t_s[1] if valid[1] else float("nan"),
                int(hit[0]), int(hit[1]),
-               c0, c1, c2]
+               c0, c1, c2] + rew + [waist_ref]
         self.rows.append(row)
 
         if step % self.print_every == 0:
@@ -91,13 +108,13 @@ class AlignRecorder:
             self.on_step(step, self.rows)
 
     def save_csv(self, path, rows):
-        # CSV (각도 deg, 시간 s)
+        # CSV (각도 deg, 시간 s, 보상 항은 그대로 소수 6자리)
         with open(path, "w") as f:
             f.write(",".join(COLS) + "\n")
             for r in rows:
                 vals = [r[0]] + [math.degrees(x) for x in r[1:7]] + [self.names[r[7]] if r[7] >= 0 else "", r[8],
                                                                     self.names[r[9]] if r[9] >= 0 else "", r[10], r[11], r[12]] \
-                       + [math.degrees(x) for x in r[13:16]]
+                       + [math.degrees(x) for x in r[13:16]] + [f"{x:.6f}" for x in r[16:20]] + [math.degrees(r[20])]
                 f.write(",".join(f"{v:.4f}" if isinstance(v, float) else str(v) for v in vals) + "\n")
 
     def summary(self, rows, label: str):

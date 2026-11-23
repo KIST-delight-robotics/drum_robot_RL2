@@ -247,6 +247,7 @@ class RDS:
     
     def _build_rds_dataset(self, midi_files: list) -> torch.Tensor:
         rds_list = []
+        num_dropped = 0
 
         for file_path in midi_files:
             bpm, events = self._read_midi_file(file_path)
@@ -257,8 +258,13 @@ class RDS:
             while not end_event:
                 rds, prev_t, end_event = self._generate_rds_from_midi(bpm, events, prev_t)
 
+                if (rds.sum(dim=-1) > 2).any():     # 한 스텝에 드럼 3개 이상 (페달은 이미 빠짐) = 손 2개로 못 침 -> 이 마디 버림
+                    num_dropped += 1
+                    continue
                 if torch.any(rds > 0):
                     rds_list.append(rds)
+
+        print(f"[RDS] MIDI 마디 {len(rds_list)}개 사용, 동시 3타 이상이라 {num_dropped}개 제외", flush=True)
 
         if len(rds_list) == 0:
             raise RuntimeError("No RDS segments were generated from MIDI files.")

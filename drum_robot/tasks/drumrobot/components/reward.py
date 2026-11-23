@@ -9,6 +9,9 @@
                     단, 이전 목표 허리가 새 쌍에서도 교집합 안이면 바꾸지 않고 유지
 행동 변화 (모든 관절)
         -w_act_rate × Σ_j (a_j,t - a_j,t-1)²   (행동 = 목표 속도라서 변화량 = 가속, 고정 관절은 행동이 0이라 0)
+허리 속도 (θ0*가 바뀐 뒤 이동 시간이 지나면)
+        s < vel_free_ratio × D 이면 0, 아니면 -w_vel × q̇0²
+        (s = θ0*가 바뀐 뒤 지난 시간, D = 바뀐 순간 다음 음표까지 남은 시간. θ0*가 안 바뀌면 s가 계속 커져 벌 유지 = 가만히 있어야 함)
 """
 
 from __future__ import annotations
@@ -35,12 +38,12 @@ from .specs import EnvRuntimeSpec, Instruments, RobotSpec
 @dataclass
 class AlignmentRewardCfg:
     w_waist: float = 1.0            # 허리 항 가중치
-    w_yaw: float = 3.0              # 어깨 yaw 항 가중치
+    w_yaw: float = 0.5              # 어깨 yaw 항 가중치 (허리만 학습: 어깨 고정이라 0, 원래 3.0)
     w1: float = 2.0                 # 식 (6) 첫째 항: 양 어깨 yaw 합이 180°에 가깝게
     w2: float = 1.0                 # 식 (6) 둘째 항: 허리가 범위 가운데에 가깝게
     k_time: float = 0.0             # 시간 가중 exp(-k_time × t)
-    waist_step_deg: float = 0.5     # 허리 훑는 간격 [deg]
-    reach_ratio: float = 0.9       # 거리 문턱 d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
+    waist_step_deg: float = 0.5     # 허리 샘플링 간격 [deg]
+    reach_ratio: float = 0.85      # 거리 문턱 d_th = reach_ratio × 팔 최대 길이 (상완 + 하완 + 스틱)
 
 class AlignmentReward:
     def __init__(
@@ -80,6 +83,24 @@ class AlignmentReward:
         self.target_waist = torch.zeros(N, device=device)                           # 현재 목표 허리 θ0*
         self.env_arange = torch.arange(N, device=device)
 
+        # 속도 벌 시계 (θ0*가 바뀐 뒤 D × vel_free_ratio 까지는 속도 벌 없음)
+        self.step_dt = env.step_dt                                                  # 정책 스텝 [s] (15 ms)
+        self.horizon_s = (env.max_lookahead_step - 1) * env.step_dt                 # 남은 시간 1.0의 길이 [s] (65칸 × 15 ms = 0.975 s)
+        self.waist_s = torch.zeros(N, device=device)                                # s: θ0*가 바뀐 뒤 지난 시간 [s]
+        self.waist_D = torch.full((N,), self.horizon_s, device=device)              # D: θ0*가 바뀐 순간 다음 음표까지 남은 시간 [s]
+        self.waist_new = torch.ones(N, device=device, dtype=torch.bool)             # 리셋 직후 첫 스텝을 θ0* 바뀜으로 셈
+        self.ref_waist = torch.zeros(N, device=device)                              # θ0_d
+        self.ref_from = torch.zeros(N, device=device)                               # θ_from: θ0*가 바뀐 순간의 θ0_d
+        self.ref_vel = torch.zeros(N, device=device)                                # θ̇0_d [rad/s]
+
+        # 어깨 yaw 기준 궤적 (손별 [오른, 왼]): 그 손 목표 드럼이 바뀌면 직전 θk_d 에서 θk*(실제 q0) 로 최소 저크, 속도는 θk_d 스텝 차분
+        self.yaw_s = torch.zeros((N, 2), device=device)                             # 그 손 목표 드럼이 바뀐 뒤 지난 시간 [s]
+        self.yaw_D = torch.full((N, 2), self.horizon_s, device=device)              # 바뀐 순간 그 손 다음 음표까지 남은 시간 [s]
+        self.yaw_new = torch.ones(N, device=device, dtype=torch.bool)               # 리셋 직후 첫 스텝을 목표 드럼 바뀜으로 셈
+        self.ref_yaw = torch.zeros((N, 2), device=device)                           # θk_d (리셋 때 env 가 시작 어깨 yaw 로 채움)
+        self.ref_yaw_from = torch.zeros((N, 2), device=device)                      # 그 손 목표 드럼이 바뀐 순간의 θk_d
+        self.ref_yaw_vel = torch.zeros((N, 2), device=device)                       # θ̇k_d [rad/s] = (이번 θk_d − 직전 θk_d) / step_dt
+
     def reset(self, env_ids: torch.Tensor, drum_pos: torch.Tensor, init_drum: torch.Tensor):
         # drum_pos:  (N, M, 3) 환경 좌표 (x, y는 IK 좌표와 같음)
         # init_drum: (n, 2) 시작 자세 드럼 [왼손, 오른손]
@@ -94,6 +115,15 @@ class AlignmentReward:
         self.target_l[env_ids] = init_drum[:, 0]
         self.target_r[env_ids] = init_drum[:, 1]
         self.target_waist[env_ids] = self.pair_waist[env_ids, init_drum[:, 1], init_drum[:, 0]]
+        self.waist_s[env_ids] = 0.0
+        self.waist_new[env_ids] = True                                              # 리셋 땐 남은 시간을 몰라서 첫 스텝에서 D를 잡음
+        self.ref_waist[env_ids] = self.target_waist[env_ids]
+        self.ref_from[env_ids] = self.target_waist[env_ids]
+        self.ref_vel[env_ids] = 0.0
+        self.yaw_s[env_ids] = 0.0
+        self.yaw_D[env_ids] = self.horizon_s
+        self.yaw_new[env_ids] = True                                                # 첫 스텝에서 D를 잡음 (ref_yaw 는 env 가 시작 자세로 채움)
+        self.ref_yaw_vel[env_ids] = 0.0
 
     def compute(
             self,
@@ -117,6 +147,7 @@ class AlignmentReward:
         self.prev_drum = torch.where(hit_any, hit_per_arm.int().argmax(dim=-1), self.prev_drum)
 
         # 2) 목표 드럼 = 플래너가 배정한 손별 다음 음표 (배정 없는 손은 직전 드럼에 머묾)
+        prev_l, prev_r = self.target_l.clone(), self.target_r.clone()
         self.target_l = torch.where(arm_valid[:, 0], arm_drum[:, 0], self.prev_drum[:, 0])
         self.target_r = torch.where(arm_valid[:, 1], arm_drum[:, 1], self.prev_drum[:, 1])
 
@@ -127,13 +158,47 @@ class AlignmentReward:
         keep = self._reach_check(pR, pL, self.target_waist[:, None])[3].squeeze(1)  # (N,) 이전 목표 ∈ B
         ok = torch.isfinite(self.pair_cost[ar, self.target_r, self.target_l])
         table = torch.where(ok, self.pair_waist[ar, self.target_r, self.target_l], self.target_waist)
+        prev_waist = self.target_waist.clone()                                      # 바뀌기 전 θ0* (속도 벌 시계용)
         self.target_waist = torch.where(keep, self.target_waist, table)
         t = arm_t.masked_fill(~arm_valid, 1.0).amin(dim=-1)                         # 시간 가중: 가장 가까운 배정 음표 (없으면 1)
 
-        # 4) 오차: 어깨 yaw 목표는 현재 실제 허리 기준 (관측에도 같은 함수를 씀)
-        err = self.signed_errors(joint_pos, drum_pos)                              # (N, 3) 목표 - 현재
-        e_waist = err[:, 0].abs()
-        e_yaw = err[:, 1].abs() + err[:, 2].abs()
+        # 속도 벌 시계 갱신: θ0*가 바뀌면 s=0, D=남은 시간. θ0*가 안 바뀌면 s += step_dt, D 유지
+        changed = (self.target_waist != prev_waist) | self.waist_new
+        self.waist_new[:] = False
+        self.waist_s = torch.where(changed, torch.zeros_like(self.waist_s), self.waist_s + self.step_dt)
+        moved = torch.stack([self.target_l != prev_l, self.target_r != prev_r], dim=1) & arm_valid   # (N, 2) 목표 드럼이 바뀐 손
+        t_move = torch.where(moved.any(dim=-1), arm_t.masked_fill(~moved, 1.0).amin(dim=-1), t)       # 바뀐 손의 다음 음표 (없으면 t)
+        # self.waist_D = torch.where(changed, (t * self.horizon_s).clamp(min=self.step_dt), self.waist_D)
+        self.waist_D = torch.where(changed, (t_move * self.horizon_s).clamp(min=self.step_dt), self.waist_D)
+        self.ref_from = torch.where(changed, self.ref_waist, self.ref_from)
+        tau = (self.waist_s / self.waist_D).clamp(0.0, 1.0)                       # τ = clip((t − t_k) / T_k, 0, 1)
+        self.ref_waist = self.ref_from + (self.target_waist - self.ref_from) * tau ** 3 * (10 - 15 * tau + 6 * tau ** 2)   # s(τ)
+        self.ref_vel = (self.target_waist - self.ref_from) * 30 * tau ** 2 * (1 - tau) ** 2 / self.waist_D               # θ̇0_d = ds/dτ / D
+
+        # 4) 오차: 어깨 yaw 목표는 목표 허리 θ0* 기준 (허리를 돌려도 어깨 오차가 안 바뀜 -> 허리로 어깨를 돕지 않음)
+        #    관측은 실제 허리 기준 그대로 (drumrobot_env 가 waist_ref 없이 부름, 실기 서버와 같음)
+        # err = self.signed_errors(joint_pos, drum_pos, waist_ref=self.target_waist) # (N, 3) 목표 - 현재
+        err = self.signed_errors(joint_pos, drum_pos)                               # (N, 3) 목표 - 현재
+        self.err_waist = err[:, 0]                                                  # 부호 있는 허리 오차 θ0* - q0 (속도 항에 씀)
+
+        # 어깨 yaw 기준 궤적: 끝점 θk* = 실제 허리 q0 기준 (err 와 같은 목표), 그 손 목표 드럼이 바뀌면 직전 θk_d 에서 다시 시작
+        q_yaw = joint_pos[:, [self.j_r, self.j_l]]                                  # (N, 2) [오른, 왼]
+        yaw_end = q_yaw + err[:, 1:]                                                # (N, 2) θk* (관절 각도 근처로 표현)
+        prev_ref_yaw = self.ref_yaw.clone()                                         # 직전 스텝 θk_d (속도 차분용)
+        moved_yaw = torch.stack([self.target_r != prev_r, self.target_l != prev_l], dim=1) | self.yaw_new[:, None]   # (N, 2) 목표 드럼이 바뀐 손
+        self.yaw_new[:] = False
+        t_yaw = arm_t[:, [1, 0]].masked_fill(~arm_valid[:, [1, 0]], 1.0)            # (N, 2) 그 손 다음 음표까지 남은 시간 (없으면 1) [오른, 왼]
+        self.yaw_s = torch.where(moved_yaw, torch.zeros_like(self.yaw_s), self.yaw_s + self.step_dt)
+        self.yaw_D = torch.where(moved_yaw, (t_yaw * self.horizon_s).clamp(min=self.step_dt), self.yaw_D)
+        self.ref_yaw_from = torch.where(moved_yaw, self.ref_yaw, self.ref_yaw_from)
+        tau_yaw = (self.yaw_s / self.yaw_D).clamp(0.0, 1.0)
+        self.ref_yaw = self.ref_yaw_from + self._wrap(yaw_end - self.ref_yaw_from) * tau_yaw ** 3 * (10 - 15 * tau_yaw + 6 * tau_yaw ** 2)   # θk_d
+        self.ref_yaw_vel = self._wrap(self.ref_yaw - prev_ref_yaw) / self.step_dt  # θ̇k_d = θk_d 스텝 차분
+
+        # e_waist = err[:, 0].abs()
+        e_waist = self._wrap(self.ref_waist - joint_pos[:, self.j_waist]).abs()    # |θ0_d − q0|
+        # e_yaw = err[:, 1].abs() + err[:, 2].abs()
+        e_yaw = self._wrap(self.ref_yaw - q_yaw).abs().sum(dim=1)                  # |θ1_d − q1| + |θ2_d − q2|
 
         reward = -torch.exp(-self.cfg.k_time * t) * (self.cfg.w_waist * e_waist + self.cfg.w_yaw * e_yaw)
 
@@ -143,8 +208,9 @@ class AlignmentReward:
         }
         return reward, log_terms
 
-    def signed_errors(self, joint_pos: torch.Tensor, drum_pos: torch.Tensor) -> torch.Tensor:
+    def signed_errors(self, joint_pos: torch.Tensor, drum_pos: torch.Tensor, waist_ref: torch.Tensor | None = None) -> torch.Tensor:
         # 지금 목표(target_waist, target_r, target_l) 기준 정렬 오차 (목표 - 현재) [rad], -π ~ π
+        # waist_ref: 어깨 yaw 목표를 계산할 허리 각도 (None = 실제 허리 q0, 관측용 / 보상은 θ0*)
         # -> (N, 3) [허리, 오른 yaw, 왼 yaw]
         ar = self.env_arange
         q0 = joint_pos[:, self.j_waist]
@@ -152,8 +218,9 @@ class AlignmentReward:
         q2 = joint_pos[:, self.j_l]
         pR = drum_pos[ar, self.target_r, :2]
         pL = drum_pos[ar, self.target_l, :2]
-        th1 = torch.atan2(pR[:, 1] - self.l * torch.sin(q0), pR[:, 0] - self.l * torch.cos(q0)) - q0
-        th2 = torch.atan2(pL[:, 1] + self.l * torch.sin(q0), pL[:, 0] + self.l * torch.cos(q0)) - q0
+        ref = q0 if waist_ref is None else waist_ref
+        th1 = torch.atan2(pR[:, 1] - self.l * torch.sin(ref), pR[:, 0] - self.l * torch.cos(ref)) - ref
+        th2 = torch.atan2(pL[:, 1] + self.l * torch.sin(ref), pL[:, 0] + self.l * torch.cos(ref)) - ref
         return torch.stack([self._wrap(self.target_waist - q0),
                             self._wrap(th1 - q1),
                             self._wrap(th2 - q2)], dim=1)
@@ -215,10 +282,11 @@ class AlignmentReward:
 # ============================================================
 @dataclass
 class RewardCfg:
-    w_align: float = 0.2                    # 정렬 보상 전체 배율
+    w_align: float = 1.0                    # 정렬 보상 전체 배율
     align: AlignmentRewardCfg = field(default_factory=AlignmentRewardCfg)
-    w_act_rate: float = 0.1                 # 행동 변화(가속) 비용, 모든 관절에 같은 가중치: 클수록 관절이 서서히 출발·정지
-                                            # (관절 하나당 w_act_rate / w_align = 0.5: 허리만 쓰던 값과 같음)
+    w_act_rate: float = 0.03                 # 행동 변화(가속) 비용
+    w_vel: float = 0.03                     # 허리 속도 비용
+    w_vel_yaw: float = 0.015                # 어깨 yaw 속도 비용 (오른 + 왼)
 
 
 class RewardComputer:
@@ -233,6 +301,8 @@ class RewardComputer:
         self.cfg = cfg
         self.alignment = AlignmentReward(device, cfg.align, env, joint_names, shoulder_z)
         self.prev_a = torch.zeros((env.num_envs, len(joint_names)), device=device)  # 직전 스텝 행동 (행동 변화 비용용)
+        self.j_waist = joint_names.index("waist_joint")                              # 허리 관절 인덱스 (허리 속도 비용용)
+        self.j_yaw = [joint_names.index("right_shoulder_1"), joint_names.index("left_shoulder_1")]   # 어깨 yaw [오른, 왼] (yaw 속도 비용용)
 
     def reset(self, env_ids: torch.Tensor, drum_pos: torch.Tensor, init_drum: torch.Tensor):
         self.alignment.reset(env_ids=env_ids, drum_pos=drum_pos, init_drum=init_drum)
@@ -242,6 +312,7 @@ class RewardComputer:
             self,
             hit_per_arm: torch.Tensor,
             joint_pos: torch.Tensor,
+            joint_vel: torch.Tensor,
             drum_pos: torch.Tensor,
             arm_drum: torch.Tensor,
             arm_t: torch.Tensor,
@@ -250,6 +321,7 @@ class RewardComputer:
     ) -> tuple[torch.Tensor, dict]:
         # hit_per_arm: (N, 2, M) 이번 스텝 타격 (가상 타격) -> 손별 직전 드럼 갱신용
         # joint_pos:   (N, 9) 로봇 좌표계 관절각
+        # joint_vel:   (N, 9) 로봇 좌표계 관절 속도 [rad/s] (허리 속도 비용용)
         # drum_pos:    (N, M, 3) 드럼 윗면 중심 (env 좌표)
         # arm_drum:    (N, 2) 플래너가 배정한 손별 다음 음표 드럼 [왼손, 오른손]
         # arm_t:       (N, 2) 손별 다음 음표까지 남은 시간 (0~1, 없으면 1)
@@ -269,11 +341,16 @@ class RewardComputer:
         r_act_rate = -self.cfg.w_act_rate * ((actions - self.prev_a) ** 2).sum(dim=-1)
         self.prev_a = actions.clone()
 
-        reward = r_align + r_act_rate
+        r_vel = -self.cfg.w_vel * (joint_vel[:, self.j_waist] - self.alignment.ref_vel).abs()
+        r_vel_yaw = -self.cfg.w_vel_yaw * (joint_vel[:, self.j_yaw] - self.alignment.ref_yaw_vel).abs().sum(dim=1)
+
+        reward = r_align + r_act_rate + r_vel + r_vel_yaw
         log_terms = {
             "rew_total": reward,
             "rew_align": r_align,
             "rew_act_rate": r_act_rate,
+            "rew_vel": r_vel,
+            "rew_vel_yaw": r_vel_yaw,
             **align_log,
         }
         return reward, log_terms

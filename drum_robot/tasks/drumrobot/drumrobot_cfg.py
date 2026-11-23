@@ -18,7 +18,7 @@ USD_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "drum_r
 PRIM_PATH = "/World/envs/env_.*/Robot"   # env_.*를 써야 수백 개의 환경에 복제됩니다.
 
 # sim
-SIM_DT = 0.0075     # 7.5ms (물리 133.3Hz) x decimation 2 = 정책 15ms (66.7Hz)
+SIM_DT = 0.005     # 5ms x decimation 3 = 정책 15ms (66.7Hz)
 DEVICE = "cuda"
 
 # drum (순서 = 드럼 인덱스)
@@ -54,18 +54,38 @@ def _drums_cfg(waist_z: float) -> RigidObjectCollectionCfg:
 class DrumRobotEnvCfg(DirectRLEnvCfg):
 
     """ 기본 환경 설정 """
-    decimation: int = 2             # 정책(Policy) 업데이트 한 번당 시뮬레이션 스텝 수
+    decimation: int = 3             # 정책(Policy) 업데이트 한 번당 시뮬레이션 스텝 수
     episode_length_s: float = 5.0   # 에피소드 최대 길이 (초)
     action_space: int = 9           # 로봇 제어 차원
-    observation_space: int = 138    # 관측 차원 (관절 9 + 관절속도 9 + 목표 앞섬 9 + 팁 6 + 드럼 24 + 다음 타격 60 + 손별 다음 음표 18 + 정렬 오차 3)
+    observation_space: int = 90    # 관측 차원 (+ 목표 어깨 yaw 속도 θ̇1_d, θ̇2_d 2)
     state_space: int = 0
 
     # 행동 -> 관절 목표: 목표 = 직전 목표 + a x scale x step_dt (직전 목표에 누적)
     action_scale: float = 13.0          # 팔·허리 목표 이동 속도 상한 [rad/s]
-    wrist_action_scale: float = 70.0    # 손목 목표 이동 속도 상한 [rad/s]
+    wrist_action_scale: float = 20.0    # 손목 목표 이동 속도 상한 [rad/s]
+
+    # 제어 지연 [물리 스텝]. 
+    action_delay_steps_min: int = 1     
+    action_delay_steps_max: int = 1
+
+    # 엔코더 해상도 (관측에만 적용, 보상은 실제 값): 실기 MIT 피드백 한 칸 크기. 0이면 끔
+    obs_pos_res: float = 25.0 / 65535       # [rad] TMotor 위치 16비트, ±12.5 rad
+    obs_vel_res: float = 100.0 / 4095       # [rad/s] TMotor 속도 12비트, ±50 rad/s
+    wrist_pos_res: float = 6.283185 / (35 * 4096)   # [rad] Maxon 엔코더 4096 × 기어 35
+    cmd_pos_res: float = 25.0 / 65535       # [rad] TMotor MIT 위치 명령 16비트 (버림). 0이면 끔
+    mit_p_limit: float = 12.5               # [rad] motors.json mit_p_limit
+    mit_v_limit: float = 50.0               # [rad/s] motors.json mit_v_limit
+    real_dir_sign: tuple = (-1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0)    # motors.json direction_sign (모터 id 0~8)
+    real_init_deg: tuple = (10.0, 90.0, 90.0, 0.0, 90.0, 0.0, 90.0, 90.0, 90.0)  # motors.json initial_joint_angle [deg] (모터 id 0~8)
 
     # 관측값 정규화
     joint_vel_scale: float = 5.0
+    obs_vel_noise_std: float = 0.06     # [rad/s] 관측 속도 가우시안 잡음 표준편차 (보상은 실제 값). 0이면 끔
+    obs_pos_noise_std: float = 1.5e-4   # [rad] 관측 위치 가우시안 잡음 표준편차 (보상은 실제 값). 0이면 끔
+    # waist_dist_std: float = 0.5         # [N m] 허리 외란 토크 표준편차 (평균 0). 0이면 끔
+    waist_dist_std: float = 0.2         # [N m] 허리 외란 토크 표준편차 (평균 0). 0이면 끔
+    yaw_dist_std: float = 0.05          # [N m] 어깨 yaw 외란 토크 표준편차 (평균 0)
+    waist_dist_hold_s: float = 0.5      # [s] 평균 몇 초마다 외란을 새로 뽑을지 (env마다 따로)
 
     # Simulation
     sim: SimulationCfg = SimulationCfg(
@@ -112,9 +132,9 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["waist_joint"],
                 stiffness=80.0,         # 실기 MIT Kp
                 damping=4.0,            # 실기 MIT Kd (상한 5)
-                effort_limit_sim=48.0,      # AK10_9 peak torque 약 48 N m
+                effort_limit_sim=36.0,      # AK10_9 peak torque 약 48 N m
                 velocity_limit_sim=28.0,    # AK10_9 no-load 약 28 rad/s
-                armature=0.01,          
+                armature=0.01,
             ),
             "arm": ImplicitActuatorCfg(
                 joint_names_expr=[
@@ -124,7 +144,7 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
                 ],
                 stiffness=80.0,         # 실기 MIT Kp
                 damping=4.0,            # 실기 MIT Kd (상한 5)
-                effort_limit_sim=24.0,      # AK70_10 peak torque 약 24.8 N m (current_limit 23.2A 와 정합)
+                effort_limit_sim=18.0,      # AK70_10 peak torque 약 24.8 N m (current_limit 23.2A 와 정합)
                 velocity_limit_sim=46.0,    # AK70_10 no-load 약 46 rad/s
                 armature=0.01,          
             ),

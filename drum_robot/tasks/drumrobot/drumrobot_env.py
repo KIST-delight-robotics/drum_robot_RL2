@@ -116,14 +116,41 @@ class DrumRobotEnv(DirectRLEnv):
             device=self.device,
             dtype=torch.float32,
         ).unsqueeze(0)  # (1, 9)
+        # self.pos_res = torch.tensor([self.cfg.wrist_pos_res if "wrist" in n else self.cfg.obs_pos_res for n in ctrl_joint_names],
+        #                             device=self.device).unsqueeze(0)   # (1, 9)
+        motor_ids = [self.robot_interface.robot_spec.joint_name_to_ik_result_idx[n] for n in ctrl_joint_names]
+        self.real_sign = torch.tensor([self.cfg.real_dir_sign[m] for m in motor_ids], device=self.device).unsqueeze(0)                 # (1, 9) 모터각 = (관절각 - init) × sign
+        self.real_init = torch.tensor([math.radians(self.cfg.real_init_deg[m]) for m in motor_ids], device=self.device).unsqueeze(0)   # (1, 9) [rad]
+        self.res_mask = torch.tensor(["wrist" not in n for n in ctrl_joint_names], device=self.device).unsqueeze(0)                  # (1, 9) TMotor만 True
+        self.wrist_ids = [i for i, n in enumerate(ctrl_joint_names) if "wrist" in n]
+        self.wrist_prev_q = torch.zeros((N, len(self.wrist_ids)), device=self.device)      # 손목 속도 유한차분용 직전 위치
+        self.wrist_seeded = torch.zeros((N,), dtype=torch.bool, device=self.device)        # 리셋 뒤 첫 관측은 손목 속도 0 (실기 obs_builder)
         # 목표가 측정값보다 앞설 수 있는 최대 폭 = 토크 제한 / 강성 [rad] (더 앞서도 토크는 안 늘고 되돌리는 시간만 늘어남)
         self.max_lead = (
             self.robot.data.joint_effort_limits[0, ctrl_joint_ids] / self.robot.data.joint_stiffness[0, ctrl_joint_ids]
         ).unsqueeze(0)  # (1, 9)
         self.target_q = torch.zeros((N, len(ctrl_joint_names)), device=self.device)   # 누적 목표 (로봇 좌표계)
-        # 정렬만 학습: 허리·어깨 yaw 외 관절은 행동 0으로 고정 (= 목표 유지, 시작 자세 그대로)
+        self.actions = torch.zeros((N, len(ctrl_joint_names)), device=self.device)    # 직전 행동 (관측용, 첫 관측이 행동보다 먼저라 미리 만듦)
+        # 허리만 학습: 허리 외 관절(어깨 yaw 포함)은 행동 0으로 고정 (= 목표 유지, 시작 자세 그대로)
+        # self.frozen_ids = [i for i, name in enumerate(ctrl_joint_names)
+        #                    if name not in ("waist_joint",)]
         self.frozen_ids = [i for i, name in enumerate(ctrl_joint_names)
-                           if name not in ("waist_joint", "left_shoulder_1", "right_shoulder_1")]
+                           if name not in ("waist_joint", "right_shoulder_1", "left_shoulder_1")]
+        self.waist_ctrl_id = ctrl_joint_names.index("waist_joint")
+        self.yaw_ctrl_ids = [ctrl_joint_names.index("right_shoulder_1"), ctrl_joint_names.index("left_shoulder_1")]   # 어깨 yaw [오른, 왼]
+        self.waist_usd_id = ctrl_joint_ids[self.waist_ctrl_id]            # 외란 넣을 관절 (articulation 번호)
+        self.waist_dist = torch.zeros((N, 1), device=self.device)           # 지금 걸린 허리 외란 [N m]
+        self.yaw_usd_ids = [ctrl_joint_ids[i] for i in self.yaw_ctrl_ids]  # 외란 넣을 어깨 yaw 관절 (articulation 번호) [오른, 왼]
+        self.yaw_dist = torch.zeros((N, 2), device=self.device)             # 지금 걸린 어깨 yaw 외란 [N m] [오른, 왼]
+
+        # 제어 지연 버퍼 (물리 스텝 단위, 순환 인덱스). max = 0이면 미사용
+        #   _apply_action이 물리 스텝마다 호출되므로 SIM_DT(7.5 ms) 해상도로 지연. env마다 [min, max]에서 뽑고 리셋마다 다시 뽑음
+        self.delay_min = int(self.cfg.action_delay_steps_min)
+        self.delay_max = int(self.cfg.action_delay_steps_max)
+        self._env_arange = torch.arange(N, device=self.device)
+        self.target_buf = torch.zeros((self.delay_max + 1, N, len(ctrl_joint_names)), device=self.device)   # 지난 목표들
+        self._delay_ptr = 0
+        self.env_delay = torch.randint(self.delay_min, self.delay_max + 1, (N,), device=self.device)       # env별 지연 D
 
         # 실제 접촉 지점이 스틱 끝에서 떨어진 거리 (팁/몸통 구분용), 물리 스텝마다 기록
         # 센서는 마지막 물리 스텝의 접촉 지점만 주므로 _apply_action에서 앞 물리 스텝 것을 받아 둠
@@ -185,7 +212,10 @@ class DrumRobotEnv(DirectRLEnv):
                 groups=(
                     ("rew_total",),                                                                 # 총 보상
                     ("rew_align", "align_waist_err_deg", "align_yaw_err_deg"),                     # 정렬
+                    # ("rew_act_rate", "rew_waist_act"),                                            # 행동 변화 (모든 관절), 허리 행동 크기  (허리 행동 크기 비용 뺌)
                     ("rew_act_rate",),                                                              # 행동 변화 (모든 관절)
+                    # ("rew_vel", "vel_gate"),                                                        # 허리 속도 (목표 근처), 문 평균
+                    ("rew_vel",),
                 ),
             ),
         )
@@ -218,9 +248,36 @@ class DrumRobotEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         # 로봇의 관절 위치
         joint_pos = self.robot_interface.get_joint_pos(self.robot)
+        if self.cfg.obs_pos_noise_std > 0:
+            noise = torch.zeros_like(joint_pos)
+            noise[:, self.waist_ctrl_id] = self.cfg.obs_pos_noise_std * torch.randn(self.num_envs, device=self.device)
+            noise[:, self.yaw_ctrl_ids] = self.cfg.obs_pos_noise_std * torch.randn(self.num_envs, 2, device=self.device)
+            joint_pos = joint_pos + noise
 
         # 로봇의 관절 속도
         joint_vel = self.robot_interface.get_joint_vel(self.robot)
+        if self.cfg.obs_vel_noise_std > 0:
+            noise = torch.zeros_like(joint_vel)
+            noise[:, self.waist_ctrl_id] = self.cfg.obs_vel_noise_std * torch.randn(self.num_envs, device=self.device)
+            noise[:, self.yaw_ctrl_ids] = self.cfg.obs_vel_noise_std * torch.randn(self.num_envs, 2, device=self.device)
+            joint_vel = joint_vel + noise
+
+        # if self.cfg.obs_pos_res > 0:
+        #     joint_pos = torch.round(joint_pos / self.pos_res) * self.pos_res          # 실기 위치 엔코더 칸
+        # if self.cfg.obs_vel_res > 0:
+        #     joint_vel = torch.round(joint_vel / self.cfg.obs_vel_res) * self.cfg.obs_vel_res   # 실기 속도 12비트 칸
+        joint_pos = self._real_feedback_pos(joint_pos)
+        if self.cfg.obs_vel_res > 0:
+            v = joint_vel * self.real_sign                                                  # 모터 좌표 속도
+            v = torch.floor((v + self.cfg.mit_v_limit) / self.cfg.obs_vel_res) * self.cfg.obs_vel_res - self.cfg.mit_v_limit   # MIT 12비트 칸 (−50 + k·칸)
+            joint_vel = torch.where(self.res_mask, v * self.real_sign, joint_vel)
+        if self.cfg.wrist_pos_res > 0:
+            wq = joint_pos[:, self.wrist_ids]
+            wv = torch.where(self.wrist_seeded[:, None], (wq - self.wrist_prev_q) / self.step_dt, torch.zeros_like(wq))   # 실기: 손목 위치 유한차분 (정책 주기)
+            joint_vel = joint_vel.clone()
+            joint_vel[:, self.wrist_ids] = wv
+            self.wrist_prev_q = wq.clone()
+            self.wrist_seeded[:] = True
 
         # 목표 앞섬 (누적 목표 - 측정 각도)
         lead = self.target_q - joint_pos
@@ -229,7 +286,7 @@ class DrumRobotEnv(DirectRLEnv):
         tip_pos = self.robot_interface.get_body_pos(self.robot)     # (N, 2, 3)
         drum_pos = self.drum_pos
 
-        # 다음 타격
+        # 다음 타격 (시각화용, 관측에는 안 넣음)
         self.next_hits = self.rds.get_next_hits(self.steps)
 
         # 손별 목표 드럼 (정렬 항과 같음: 다음 음표 드럼, 없으면 그 손이 직전에 친 드럼) one-hot + 남은 시간 (없으면 1)
@@ -237,7 +294,17 @@ class DrumRobotEnv(DirectRLEnv):
         al = self.reward_computer.alignment
         arm_target = torch.stack([al.target_l, al.target_r], dim=1)                 # (N, 2) [왼손, 오른손]
         arm_next = torch.cat([F.one_hot(arm_target, M).float(), self.arm_t[..., None]], dim=-1)   # (N, 2, M+1)
-        align_err = al.signed_errors(joint_pos, drum_pos) / math.pi                 # (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw], -1 ~ 1
+        # align_err = al.signed_errors(joint_pos, drum_pos) / math.pi                 # (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw], -1 ~ 1  (θ0*로 바꿈)
+        j0 = al.j_waist
+        # waist_des = ((al.target_waist - self.joint_center[0, j0]) / self.joint_half_range[0, j0])[:, None]   # (N, 1) 목표 허리 θ0*, 관절 각도와 같은 정규화, -1 ~ 1
+        waist_des = ((al.ref_waist - self.joint_center[0, j0]) / self.joint_half_range[0, j0])[:, None]   # θ0_d
+        waist_vel_des = al.ref_vel[:, None]                                         # (N, 1) θ̇0_d [rad/s] (정규화는 pack 에서 관절 속도와 같게)
+        # yaw_err = al.signed_errors(joint_pos, drum_pos)[:, 1:]                      # (N, 2) θ* − q [오른 yaw, 왼 yaw] (현재 허리 기준, 보상과 같은 목표)
+        # yaw_des = (joint_pos[:, self.yaw_ctrl_ids] + yaw_err - self.joint_center[0, self.yaw_ctrl_ids]) / self.joint_half_range[0, self.yaw_ctrl_ids]   # (N, 2) 목표 yaw θ1*, θ2*, 관절 각도와 같은 정규화
+        yaw_des = (al.ref_yaw - self.joint_center[0, self.yaw_ctrl_ids]) / self.joint_half_range[0, self.yaw_ctrl_ids]   # (N, 2) θ1_d, θ2_d, 관절 각도와 같은 정규화
+        yaw_vel_des = al.ref_yaw_vel                                                # (N, 2) θ̇1_d, θ̇2_d [rad/s] (정규화는 pack 에서 관절 속도와 같게)
+        # waist_phase = (al.waist_s / al.waist_D).clamp(max=1.0)[:, None]          # (N, 1) θ0* 바뀐 뒤 진행률 s/D, 0 ~ 1 (속도 벌은 vel_free_ratio부터)
+        # waist_phase = joint_pos[:, :0]                                              # (N, 0) 진행률 칸 뺌
 
         obs = self._normalize_and_pack_obs(
             joint_pos=joint_pos,
@@ -245,15 +312,32 @@ class DrumRobotEnv(DirectRLEnv):
             lead=lead,
             tip_pos=tip_pos,
             drum_pos=drum_pos,
-            next_hits=self.next_hits,
+            # next_hits=self.next_hits,     # 다음 타격 관측 뺌
             arm_next=arm_next,
-            align_err=align_err,
+            # align_err=align_err,          # θ0*로 바꿈
+            waist_des=waist_des,
+            waist_vel_des=waist_vel_des,
+            yaw_des=yaw_des,
+            yaw_vel_des=yaw_vel_des,
+            # waist_phase=waist_phase,
+            last_action=self.actions,
             )
         
         if torch.isnan(obs).any():
             raise RuntimeError("NaN obs")
         
         return {"policy": obs}
+
+    def _real_feedback_pos(self, q: torch.Tensor) -> torch.Tensor:
+        # 실기 피드백 위치: 관절각 -> 모터각 -> 엔코더 칸 버림 -> 관절각 (TMotor: MIT 16비트 −12.5 + k·칸, 손목: Maxon 카운트 k·칸)
+        m = (q - self.real_init) * self.real_sign
+        if self.cfg.obs_pos_res > 0:
+            mt = torch.floor((m + self.cfg.mit_p_limit) / self.cfg.obs_pos_res) * self.cfg.obs_pos_res - self.cfg.mit_p_limit
+            m = torch.where(self.res_mask, mt, m)
+        if self.cfg.wrist_pos_res > 0:
+            mw = torch.floor(m / self.cfg.wrist_pos_res) * self.cfg.wrist_pos_res
+            m = torch.where(self.res_mask, m, mw)
+        return m * self.real_sign + self.real_init
 
     def _pre_physics_step(self, actions: torch.Tensor):
         # RL 에이전트로부터 받은 actions 저장
@@ -262,18 +346,25 @@ class DrumRobotEnv(DirectRLEnv):
         # action 범위를 [-1, 1]로 강제
         actions = torch.clamp(actions, -1.0, 1.0)
 
-        # 정렬만 학습: 허리·어깨 yaw 외 관절은 행동 0 (= 목표 유지, 시작 자세 그대로)
+        # 허리만 학습: 허리 외 관절은 행동 0 (= 목표 유지, 시작 자세 그대로)
         actions[:, self.frozen_ids] = 0.0
 
         # 로봇 위치 가져오기
-        robot_q = self.robot_interface.get_joint_pos(self.robot)
+        # robot_q = self.robot_interface.get_joint_pos(self.robot)
+        robot_q = self._real_feedback_pos(self.robot_interface.get_joint_pos(self.robot))   # 실기 max_lead clamp 기준 = 피드백 값
 
         # 목표 위치 = 직전 목표 + actions (행동 0이면 목표 유지 -> 중력을 버팀)
         target_q = self.target_q + actions * self.action_scale_vec * self.step_dt
         target_q = torch.max(torch.min(target_q, robot_q + self.max_lead), robot_q - self.max_lead)  # 측정값 ± 최대 앞섬
         low, high = self.robot_interface.get_limit()
         self.target_q = torch.max(torch.min(target_q, high), low)                                      # 관절 제한
-        usd_q_next = self.robot_interface.clip_and_convert(self.target_q)
+        # usd_q_next = self.robot_interface.clip_and_convert(self.target_q)
+        q_cmd = self.target_q
+        if self.cfg.cmd_pos_res > 0:
+            m = (self.target_q - self.real_init) * self.real_sign                                       # 모터각
+            m = torch.floor((m + self.cfg.mit_p_limit) / self.cfg.cmd_pos_res) * self.cfg.cmd_pos_res - self.cfg.mit_p_limit   # MIT 16비트 버림 (floatToUint)
+            q_cmd = torch.where(self.res_mask, m * self.real_sign + self.real_init, self.target_q)     # 손목(CST)은 그대로
+        usd_q_next = self.robot_interface.clip_and_convert(q_cmd)
 
         self.actions = actions.clone()
         self.target_joint_pos = usd_q_next
@@ -292,7 +383,24 @@ class DrumRobotEnv(DirectRLEnv):
         self._substep += 1
 
         ctrl_joint_ids = self.robot_interface.get_ctrl_joint_ids()
-        self.robot.set_joint_position_target(self.target_joint_pos, joint_ids=ctrl_joint_ids)
+        if self.delay_max > 0:
+            # 순환 버퍼에 이번 목표를 넣고, env마다 D 물리 스텝 전 목표를 꺼내 적용 (D = 0이면 이번 목표)
+            n = self.delay_max + 1
+            self._delay_ptr = (self._delay_ptr + 1) % n
+            self.target_buf[self._delay_ptr] = self.target_joint_pos
+            idx = (self._delay_ptr - self.env_delay) % n                    # (N,) env별 읽을 칸
+            target = self.target_buf[idx, self._env_arange]                  # (N, 9)
+        else:
+            target = self.target_joint_pos
+        self.robot.set_joint_position_target(target, joint_ids=ctrl_joint_ids)
+        if self.cfg.waist_dist_std > 0:
+            renew = torch.rand(self.num_envs, 1, device=self.device) < self.physics_dt / self.cfg.waist_dist_hold_s
+            self.waist_dist = torch.where(renew, self.cfg.waist_dist_std * torch.randn_like(self.waist_dist), self.waist_dist)
+            self.robot.set_joint_effort_target(self.waist_dist, joint_ids=[self.waist_usd_id])
+            renew_yaw = torch.rand(self.num_envs, 2, device=self.device) < self.physics_dt / self.cfg.waist_dist_hold_s   # 관절마다 따로 다시 뽑음
+            # self.yaw_dist = torch.where(renew_yaw, self.cfg.waist_dist_std * torch.randn_like(self.yaw_dist), self.yaw_dist)
+            self.yaw_dist = torch.where(renew_yaw, self.cfg.yaw_dist_std * torch.randn_like(self.yaw_dist), self.yaw_dist)
+            self.robot.set_joint_effort_target(self.yaw_dist, joint_ids=self.yaw_usd_ids)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # episode time out
@@ -317,9 +425,11 @@ class DrumRobotEnv(DirectRLEnv):
 
         # 보상: 허리·어깨 정렬
         joint_pos = self.robot_interface.get_joint_pos(self.robot)
+        joint_vel = self.robot_interface.get_joint_vel(self.robot)
         reward, reward_log = self.reward_computer.compute(
             hit_per_arm=virtual,
             joint_pos=joint_pos,
+            joint_vel=joint_vel,
             drum_pos=self.drum_pos,
             arm_drum=self.arm_drum,
             arm_t=self.arm_t,
@@ -330,6 +440,7 @@ class DrumRobotEnv(DirectRLEnv):
         # 로그 출력
         self.logger.add(reward_log)
         self.logger.maybe_flush()
+        self.extras["log"] = {k: v.float().mean() for k, v in reward_log.items()}   # 텐서보드: skrl 이 "Info / 키" 로 기록 (전체 env 평균)
 
         # 시각화 (가상 타격 표시, 드럼 색상 변경)
         self.visualizer.step(tip_pos=tip_pos, next_hits=self.next_hits, hit_per_arm=virtual)
@@ -349,22 +460,32 @@ class DrumRobotEnv(DirectRLEnv):
         self._reset_drum(env_ids)
 
         # RDS 리셋
-        self.rds.reset(env_ids=env_ids, score_ratio=0.0, selection_strength=0.0)  # 랜덤으로 RDS 생성해서 사용
+        self.rds.reset(env_ids=env_ids, score_ratio=0.0, selection_strength=0.0)  # 무작위 악보만 (배포 모델 환경, MIDI 섞을 때는 0.3)
 
         # 로봇 자세 리셋
         init_robot_pos, init_drum = self.robot_initializer.reset_init_pos(env_ids)
         joint_pos, joint_vel = self.robot_interface.reset(robot=self.robot, env_ids=env_ids, init_robot_pos=init_robot_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        self.wrist_seeded[env_ids] = False      # 손목 속도 유한차분 다시 시작
+
+        # 지연 버퍼를 리셋 자세로 채우고 env별 지연 다시 뽑기 (안 하면 새 에피소드 첫 스텝에 이전 에피소드 목표가 적용됨)
+        if self.delay_max > 0:
+            self.target_buf[:, env_ids, :] = joint_pos[:, self.robot_interface.get_ctrl_joint_ids()]
+            self.env_delay[env_ids] = torch.randint(self.delay_min, self.delay_max + 1, (len(env_ids),), device=self.device)
 
         # 누적 목표 = 시작 자세 (관절 제한 안)
         low, high = self.robot_interface.get_limit()
         self.target_q[env_ids] = torch.max(torch.min(init_robot_pos, high), low)
+        self.waist_dist[env_ids] = self.cfg.waist_dist_std * torch.randn(len(env_ids), 1, device=self.device)
+        # self.yaw_dist[env_ids] = self.cfg.waist_dist_std * torch.randn(len(env_ids), 2, device=self.device)
+        self.yaw_dist[env_ids] = self.cfg.yaw_dist_std * torch.randn(len(env_ids), 2, device=self.device)
 
         # 타격 감지 리셋 (rds.reset 이후: 새 악보로 매칭 범위 계산)
         self.hit_detector.reset(env_ids=env_ids, rds=self.rds.get_rds())
 
         # 보상 리셋 (드럼 위치 리셋 이후: 드럼 쌍별 목표 허리 표 계산)
         self.reward_computer.reset(env_ids=env_ids, drum_pos=self.drum_pos, init_drum=init_drum)
+        self.reward_computer.alignment.ref_yaw[env_ids] = self.target_q[env_ids][:, self.yaw_ctrl_ids]   # 시작 θk_d = 시작 어깨 yaw (리셋 직후 첫 관측도 이 값)
 
         # 손 배정 리셋
         self.planner.reset(env_ids)                     # 확정된 배정 지움
@@ -387,21 +508,35 @@ class DrumRobotEnv(DirectRLEnv):
     def _init_obs(self):
         # obs 차원 계산
         M = len(self.instruments.all)
-        K = self.rds.cfg.num_hits
-        
+        # K = self.rds.cfg.num_hits                    # 다음 타격 관측 뺌
+
         self.obs_dim_joint_pos = 9                     # ctrl 관절 수
         self.obs_dim_joint_vel = 9
         self.obs_dim_lead      = 9                     # 목표 앞섬 (누적 목표 - 측정 각도)
         self.obs_dim_tip       = 2 * 3                 # 양손 * xyz
         self.obs_dim_drum      = M * 3                 # 드럼 * xyz
-        self.obs_dim_next      = K * (M + 2)           # lookahead K개 * (one-hot M + time + valid)
+        # self.obs_dim_next      = K * (M + 2)           # lookahead K개 * (one-hot M + time + valid)  (다음 타격 관측 뺌)
         self.obs_dim_arm       = 2 * (M + 1)           # 손별 다음 음표 (플래너 배정): 드럼 one-hot M + 남은 시간
-        self.obs_dim_align     = 3                     # 정렬 오차 (허리, 오른 yaw, 왼 yaw)
+        # self.obs_dim_align     = 3                     # 정렬 오차 (허리, 오른 yaw, 왼 yaw)  (θ0*로 바꿈)
+        self.obs_dim_waist_des = 1                     # 목표 허리 θ0*
+        self.obs_dim_waist_vel_des = 1                 # 목표 허리 속도 θ̇0_d
+        self.obs_dim_yaw_des   = 2                     # 목표 어깨 yaw θ1*, θ2*
+        self.obs_dim_yaw_vel_des = 2                   # 목표 어깨 yaw 속도 θ̇1_d, θ̇2_d
+        # self.obs_dim_waist_phase = 1                   # θ0* 바뀐 뒤 진행률 s/D
+        # self.obs_dim_waist_phase = 0                   # 진행률 칸 뺌
+        self.obs_dim_last_act  = 9                     # 직전 행동
 
         obs_dim_total = (
             self.obs_dim_joint_pos + self.obs_dim_joint_vel + self.obs_dim_lead
             + self.obs_dim_tip + self.obs_dim_drum
-            + self.obs_dim_next + self.obs_dim_arm + self.obs_dim_align
+            # + self.obs_dim_next                       # 다음 타격 관측 뺌
+            # + self.obs_dim_align                      # θ0*로 바꿈
+            # + self.obs_dim_arm + self.obs_dim_waist_des + self.obs_dim_waist_phase
+            # + self.obs_dim_arm + self.obs_dim_waist_des + self.obs_dim_waist_vel_des + self.obs_dim_waist_phase
+            # + self.obs_dim_arm + self.obs_dim_waist_des + self.obs_dim_waist_vel_des
+            # + self.obs_dim_arm + self.obs_dim_waist_des + self.obs_dim_waist_vel_des + self.obs_dim_yaw_des
+            + self.obs_dim_arm + self.obs_dim_waist_des + self.obs_dim_waist_vel_des + self.obs_dim_yaw_des + self.obs_dim_yaw_vel_des
+            + self.obs_dim_last_act
         )
 
         if obs_dim_total != self.cfg.observation_space:
@@ -458,16 +593,25 @@ class DrumRobotEnv(DirectRLEnv):
             lead: torch.Tensor,
             tip_pos: torch.Tensor,
             drum_pos: torch.Tensor,
-            next_hits: torch.Tensor,
+            # next_hits: torch.Tensor,      # 다음 타격 관측 뺌
             arm_next: torch.Tensor,
-            align_err: torch.Tensor,
+            # align_err: torch.Tensor,      # θ0*로 바꿈
+            waist_des: torch.Tensor,
+            waist_vel_des: torch.Tensor,
+            yaw_des: torch.Tensor,
+            yaw_vel_des: torch.Tensor,
+            # waist_phase: torch.Tensor,
+            last_action: torch.Tensor,
         ) -> torch.Tensor:
         # joint_pos, joint_vel, lead: (N, 9)
         # tip_pos: (N, 2, 3)
         # drum_pos: (N, M, 3)
-        # next_hits: (N, K, M+2)
+        # # next_hits: (N, K, M+2)        (다음 타격 관측 뺌)
         # arm_next: (N, 2, M+1) 손별 다음 음표 (이미 0~1)
-        # align_err: (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw] (이미 -1~1)
+        # # align_err: (N, 3) 정렬 오차 [허리, 오른 yaw, 왼 yaw] (이미 -1~1)  (θ0*로 바꿈)
+        # waist_des: (N, 1) 목표 허리 θ0* (관절 각도와 같은 정규화, 이미 -1~1)
+        # # waist_phase: (N, 1) θ0* 바뀐 뒤 진행률 s/D (이미 0~1)
+        # last_action: (N, 9) 직전 행동 (clamp, 고정 관절 0 적용 후, 이미 -1~1)
 
         # normalize
         joint_pos_n = (joint_pos - self.joint_center) / self.joint_half_range
@@ -475,6 +619,11 @@ class DrumRobotEnv(DirectRLEnv):
 
         joint_vel_n = joint_vel / self.joint_vel_scale
         joint_vel_n = torch.clamp(joint_vel_n, -10.0, 10.0)
+
+        waist_vel_des_n = torch.clamp(waist_vel_des / self.joint_vel_scale, -10.0, 10.0)   # θ̇0_d, 관절 속도와 같은 정규화
+        yaw_vel_des_n = torch.clamp(yaw_vel_des / self.joint_vel_scale, -10.0, 10.0)       # θ̇1_d, θ̇2_d, 관절 속도와 같은 정규화
+        # waist_vel_des_n = waist_vel_des                 # θ̇0_d [rad/s] 그대로 (정규화 안 함)
+        # yaw_vel_des_n = yaw_vel_des                     # θ̇1_d, θ̇2_d [rad/s] 그대로 (정규화 안 함)
 
         lead_n = lead / self.max_lead                   # -1 ~ 1 (최대 앞섬으로 나눔)
 
@@ -491,9 +640,15 @@ class DrumRobotEnv(DirectRLEnv):
                 lead_n,
                 tip_pos_n.reshape(self.num_envs, self.obs_dim_tip),
                 drum_pos_n.reshape(self.num_envs, self.obs_dim_drum),
-                next_hits.reshape(self.num_envs, self.obs_dim_next),
+                # next_hits.reshape(self.num_envs, self.obs_dim_next),   # 다음 타격 관측 뺌
                 arm_next.reshape(self.num_envs, self.obs_dim_arm),
-                align_err,
+                # align_err,                    # θ0*로 바꿈
+                waist_des,
+                waist_vel_des_n,
+                yaw_des,
+                yaw_vel_des_n,
+                # waist_phase,
+                last_action,
             ],
             dim=-1
         )
@@ -514,7 +669,7 @@ class DrumRobotEnv(DirectRLEnv):
     def _get_tip_velocity(self) -> torch.Tensor:
         # 팁 속도 (N, 2, 3) = 손목 링크 속도 + 각속도 × (손목 -> 팁)  (플래너 입력, planner_test와 같은 계산)
         d = self.robot.data
-        v = d.body_lin_vel_w[:, self.wrist_body_ids]
+        v = d.body_link_lin_vel_w[:, self.wrist_body_ids]   # 링크 원점 속도 (body_lin_vel_w는 질량중심 속도라 팁보다 0.111 m 바깥 점이 됨)
         w = d.body_ang_vel_w[:, self.wrist_body_ids]
         r = math_utils.quat_apply(d.body_quat_w[:, self.wrist_body_ids], self.stick_tip_off.expand_as(v))
         return v + torch.cross(w, r, dim=-1)
@@ -562,3 +717,6 @@ class DrumRobotEnv(DirectRLEnv):
     def _reset_tensors(self, env_ids: torch.Tensor):
         # 스텝 리셋
         self.steps[env_ids] = 0
+
+        # 직전 행동 리셋 (새 에피소드 첫 관측에 이전 에피소드 행동이 안 들어가게, 보상 prev_a 리셋과 같음)
+        self.actions[env_ids] = 0.0

@@ -113,7 +113,8 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
             usd_path=USD_PATH,
             activate_contact_sensors=True,      # 로봇 강체에 PhysX 접촉 보고 켜기 (ContactSensor 필요)
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=False,
+                # enabled_self_collisions=False,
+                enabled_self_collisions=True,       # 자기 충돌 켜기 (교차 타격 때 팔·손목·스틱끼리 부딪힘)
                 solver_position_iteration_count=4,
                 solver_velocity_iteration_count=1,
             ),

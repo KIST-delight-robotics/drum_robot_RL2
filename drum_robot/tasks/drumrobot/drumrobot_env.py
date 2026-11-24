@@ -435,6 +435,7 @@ class DrumRobotEnv(DirectRLEnv):
             arm_t=self.arm_t,
             arm_valid=self.arm_valid,
             actions=self.actions,
+            waist_q=self._real_feedback_pos(joint_pos)[:, self.waist_ctrl_id],   # 양자화된 허리 q0 (어깨 yaw 끝점 θk* 계산용, 실기 측정값과 같은 엔코더 칸)
         )
 
         # 로그 출력

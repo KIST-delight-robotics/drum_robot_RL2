@@ -133,6 +133,7 @@ class AlignmentReward:
             arm_t: torch.Tensor,
             arm_valid: torch.Tensor,
             hit_per_arm: torch.Tensor,
+            waist_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         # joint_pos:   (N, 9) 로봇 좌표계 관절각 (ctrl 관절 순서)
         # drum_pos:    (N, M, 3)
@@ -183,7 +184,8 @@ class AlignmentReward:
 
         # 어깨 yaw 기준 궤적: 끝점 θk* = 실제 허리 q0 기준 (err 와 같은 목표), 그 손 목표 드럼이 바뀌면 직전 θk_d 에서 다시 시작
         q_yaw = joint_pos[:, [self.j_r, self.j_l]]                                  # (N, 2) [오른, 왼]
-        yaw_end = q_yaw + err[:, 1:]                                                # (N, 2) θk* (관절 각도 근처로 표현)
+        # yaw_end = q_yaw + err[:, 1:]                                                # (N, 2) θk* (관절 각도 근처로 표현)
+        yaw_end = q_yaw + self.signed_errors(joint_pos, drum_pos, waist_ref=waist_q)[:, 1:]   # (N, 2) θk* (양자화된 허리 q0 기준, 관절 각도 근처로 표현)
         prev_ref_yaw = self.ref_yaw.clone()                                         # 직전 스텝 θk_d (속도 차분용)
         moved_yaw = torch.stack([self.target_r != prev_r, self.target_l != prev_l], dim=1) | self.yaw_new[:, None]   # (N, 2) 목표 드럼이 바뀐 손
         self.yaw_new[:] = False
@@ -284,7 +286,8 @@ class AlignmentReward:
 class RewardCfg:
     w_align: float = 1.0                    # 정렬 보상 전체 배율
     align: AlignmentRewardCfg = field(default_factory=AlignmentRewardCfg)
-    w_act_rate: float = 0.03                 # 행동 변화(가속) 비용
+    # w_act_rate: float = 0.03                 # 행동 변화(가속) 비용
+    w_act_rate: float = 0.3                  # 행동 변화(가속) 비용 (10배: 명령 떨림 억제)
     w_vel: float = 0.03                     # 허리 속도 비용
     w_vel_yaw: float = 0.015                # 어깨 yaw 속도 비용 (오른 + 왼)
 
@@ -318,6 +321,7 @@ class RewardComputer:
             arm_t: torch.Tensor,
             arm_valid: torch.Tensor,
             actions: torch.Tensor,
+            waist_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         # hit_per_arm: (N, 2, M) 이번 스텝 타격 (가상 타격) -> 손별 직전 드럼 갱신용
         # joint_pos:   (N, 9) 로봇 좌표계 관절각
@@ -327,6 +331,7 @@ class RewardComputer:
         # arm_t:       (N, 2) 손별 다음 음표까지 남은 시간 (0~1, 없으면 1)
         # arm_valid:   (N, 2) 손별 다음 음표 있음
         # actions:     (N, 9) 이번 스텝 행동 (-1 ~ 1, = 관절 목표 속도 / 배율)
+        # waist_q:     (N,) 양자화된 허리 q0 (어깨 yaw 끝점 θk* 계산용, None = joint_pos 의 q0)
         align, align_log = self.alignment.compute(
             joint_pos=joint_pos,
             drum_pos=drum_pos,
@@ -334,6 +339,7 @@ class RewardComputer:
             arm_t=arm_t,
             arm_valid=arm_valid,
             hit_per_arm=hit_per_arm,
+            waist_q=waist_q,
         )
         r_align = self.cfg.w_align * align
 

@@ -258,7 +258,8 @@ class RDS:
             while not end_event:
                 rds, prev_t, end_event = self._generate_rds_from_midi(bpm, events, prev_t)
 
-                if (rds.sum(dim=-1) > 2).any():     # 한 스텝에 드럼 3개 이상 (페달은 이미 빠짐) = 손 2개로 못 침 -> 이 마디 버림
+                # if (rds.sum(dim=-1) > 2).any():     # 한 스텝에 드럼 3개 이상 (페달은 이미 빠짐) = 손 2개로 못 침 -> 이 마디 버림
+                if ((rds > 0).sum(dim=-1) > 2).any():   # 한 스텝에 드럼 3개 이상 (값이 세기 1~7이라 개수로 셈) -> 이 마디 버림
                     num_dropped += 1
                     continue
                 if torch.any(rds > 0):
@@ -310,7 +311,8 @@ class RDS:
 
                     time_sec = (current_time * tempo) / (ticks_per_beat * 1_000_000)
 
-                    events.append((time_sec, instrument))
+                    # events.append((time_sec, instrument))
+                    events.append((time_sec, instrument, msg.velocity))     # MIDI velocity 1~127 (세기 환산은 _generate_rds_from_midi)
 
         events.sort()   # 멀티 트랙인 경우 시간 순으로 정렬
 
@@ -319,7 +321,8 @@ class RDS:
     def _generate_rds_from_midi(
             self,
             bpm: float,
-            events: list[tuple[float, str]],
+            # events: list[tuple[float, str]],
+            events: list[tuple[float, str, int]],      # (시각 [s], 악기, MIDI velocity)
             prev_t: float,
     ) -> tuple[torch.Tensor, float, bool]:
         T = self.env.episode_length_step
@@ -334,7 +337,8 @@ class RDS:
         end = True
         next_t = 0.0
 
-        for t, note in events:
+        # for t, note in events:
+        for t, note, vel in events:
             if t < prev_t:
                 continue
 
@@ -361,12 +365,15 @@ class RDS:
                 continue  # episode 길이 초과 이벤트는 무시
 
             # 모든 env에 이벤트 적용
-            robotic_drum_score[time_idx, drum_idx] = 1
+            # robotic_drum_score[time_idx, drum_idx] = 1
+            grade = 1 + int(6.0 * vel / 127.0 + 0.5)                       # 실기 midi_score.cpp 와 같은 세기 환산: 1 + lround(6 × velocity / 127), 1~7
+            robotic_drum_score[time_idx, drum_idx] = max(int(robotic_drum_score[time_idx, drum_idx]), grade)   # 같은 칸에 두 음이면 센 쪽
 
         return robotic_drum_score, next_t, end
 
     def _compute_score(self, rds_tensors: torch.Tensor) -> torch.Tensor:
         # rds_tensors: (N, T, M), 0/1
+        rds_tensors = (rds_tensors > 0).long()  # 값이 세기 1~7 -> 점수는 타격 여부(0/1)로만 계산
         N, T, M = rds_tensors.shape
 
         # 1. 사용된 드럼 개수

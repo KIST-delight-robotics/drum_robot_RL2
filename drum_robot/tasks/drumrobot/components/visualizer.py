@@ -17,7 +17,6 @@ from .specs import EnvRuntimeSpec, Instruments
 class VisualizerCfg:
     """ 시각화 설정 """
     enable_visualization: bool = False
-    # enable_visualization: bool = True
 
     drum_radius: float = 0.1
     drum_height: float = 0.01

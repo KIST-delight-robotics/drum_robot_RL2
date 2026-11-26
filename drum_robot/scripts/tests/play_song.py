@@ -59,6 +59,9 @@ NOTE_TO_DRUM = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 4}
 START_PAIR = ("snare", "snare")
 
 
+GRADES = []                                                          # 이벤트별 {시뮬 드럼: 세기 1~7} (실기 make_drum_event: 5·6열 = velocity_R, velocity_L)
+
+
 def read_song(path: Path):
     # RDS 텍스트 -> bpm, [(시각 s, [시뮬 드럼, ...]), ...]  (실기 서버 make_drum_event와 같은 시간 계산)
     bpm, t, events = 100.0, 0.0, []
@@ -75,6 +78,11 @@ def read_song(path: Path):
         drums = sorted({NOTE_TO_DRUM[int(n)] for n in (it[2], it[3]) if int(n) != 0})   # 오른손, 왼손 열 (킥 열은 안 씀)
         if drums:
             events.append((t, drums))
+            g = {}
+            for n, v in ((it[2], it[4]), (it[3], it[5])):            # (오른손 음, 오른손 세기), (왼손 음, 왼손 세기)
+                if int(n) != 0:
+                    g[NOTE_TO_DRUM[int(n)]] = max(g.get(NOTE_TO_DRUM[int(n)], 0), int(v))   # 같은 드럼 두 손이면 센 쪽 (학습 악보와 같음)
+            GRADES.append(g)
     if not events:
         raise SystemExit(f"타격이 없는 곡입니다: {path}")
     return bpm, events
@@ -249,12 +257,16 @@ def _patched_make(*args, **kwargs):
 
     # 곡 -> 시뮬 악보 (T, M): 리셋 때 무작위 악보 대신 이 곡
     song = torch.zeros((T, M), dtype=torch.int64, device=u.device)
-    for t, drums in EVENTS:
+    # for t, drums in EVENTS:
+    for i, (t, drums) in enumerate(EVENTS):
         s = round(t / dt)
         if s >= T - u.hit_detector.max_window:
             raise SystemExit(f"곡 시각이 에피소드 끝을 넘음: {t:.3f}s")
-        song[s, drums] = 1
+        # song[s, drums] = 1
+        for d in drums:
+            song[s, d] = max(int(song[s, d]), GRADES[i][d])         # 악보 값 = 세기 1~7 (54: 관측·판정이 이 값을 세기로 씀)
     u.rds._reset_random = lambda env_ids: song[None].expand(len(env_ids), -1, -1).clone()
+    u.rds._reset_midi = lambda env_ids, selection_strength=0.0: song[None].expand(len(env_ids), -1, -1).clone()   # 54: score_ratio 1.0 이라 env 1개도 MIDI 경로로 리셋됨
 
     # 조건 고정: 드럼 위치 노이즈 0, 시작 자세 = 스네어·스네어 쌍 (관절 노이즈 0)
     u.instruments.drum_noise_scale = 0.0

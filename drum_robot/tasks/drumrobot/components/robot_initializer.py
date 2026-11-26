@@ -31,7 +31,22 @@ class RobotInitializerCfg:
 
     height_above_drum: float = 0.1
 
+    # 실기 서버 drum_coordinate.json 의 손별 타격점 [m] (허리 조인트 기준) 과 손목 각도 [deg]
+    #   이름 -> (오른손 위치, 오른손 손목, 왼손 위치, 왼손 손목). 시작 자세 = 이 타격 자세 + 손목 대기 각도 (실기 리셋과 같음)
+    hit_points: dict = field(default_factory=lambda: {
+        "snare":   ((-0.061, 0.363, -0.443), 10.0, (-0.139, 0.358, -0.427), 10.0),
+        "floor":   (( 0.284, 0.358, -0.423), 10.0, ( 0.180, 0.359, -0.457), 10.0),
+        "mid":     (( 0.244, 0.585, -0.327),  5.0, ( 0.188, 0.608, -0.339),  5.0),
+        "high":    ((-0.031, 0.614, -0.263),  5.0, (-0.106, 0.600, -0.288),  5.0),   # json "top"
+        "hihat":   ((-0.266, 0.514, -0.174), 10.0, (-0.318, 0.472, -0.183), 10.0),   # json "closed hihat"
+        "ride":    (( 0.357, 0.625, -0.106), 15.0, ( 0.295, 0.663, -0.095), 15.0),
+        "crash_r": (( 0.496, 0.404, -0.208), 10.0, ( 0.474, 0.444, -0.200), 10.0),   # json "right crash"
+        "crash_l": ((-0.162, 0.676, -0.083), 10.0, (-0.205, 0.661, -0.121), 10.0),   # json "left crash"
+    })
+    wrist_stay_deg: float = 20.0            # 실기 스트로크 규칙 손목 대기 각도: 타격 자세에서 손목을 이만큼 들어 올린 자세로 시작 (+ = 드는 방향)
+
     joint_noise_scale: float = 5*math.pi/180
+    noise_joints: tuple = ("waist_joint", "right_shoulder_1", "left_shoulder_1")    # 시작 자세 노이즈를 넣는 관절 (스틱 높이를 안 바꾸는 허리·어깨 yaw만)
 
 class RobotInitializer:
     def __init__(
@@ -47,6 +62,7 @@ class RobotInitializer:
         self.robot = RobotSpec()
 
         self._init_pos_angle()
+        self.noise_mask = torch.tensor([float(n in cfg.noise_joints) for n in ctrl_joint_names], device=self.device)   # (9,) 노이즈 넣는 관절 1
 
     def _init_pos_angle(self):
         N = len(self.cfg.drum_pairs)
@@ -56,29 +72,42 @@ class RobotInitializer:
         inst_by_name = self.instruments.all
 
         # 각 페어의 좌/우 팁 목표 위치를 바로 텐서로
+        # pl = torch.tensor(
+        #     [inst_by_name[l_name].position for l_name, _ in self.cfg.drum_pairs],
+        #     device=self.device, dtype=torch.float32,
+        # )  # (N, 3)
+        # pr = torch.tensor(
+        #     [inst_by_name[r_name].position for _, r_name in self.cfg.drum_pairs],
+        #     device=self.device, dtype=torch.float32,
+        # )  # (N, 3)
         pl = torch.tensor(
-            [inst_by_name[l_name].position for l_name, _ in self.cfg.drum_pairs],
+            [self.cfg.hit_points[l_name][2] for l_name, _ in self.cfg.drum_pairs],
             device=self.device, dtype=torch.float32,
-        )  # (N, 3)
+        )  # (N, 3) 왼손 타격점 (실기 json)
         pr = torch.tensor(
-            [inst_by_name[r_name].position for _, r_name in self.cfg.drum_pairs],
+            [self.cfg.hit_points[r_name][0] for _, r_name in self.cfg.drum_pairs],
             device=self.device, dtype=torch.float32,
-        )  # (N, 3)
+        )  # (N, 3) 오른손 타격점 (실기 json)
 
-        pl[:, 2] = pl[:, 2] + self.cfg.height_above_drum
-        pr[:, 2] = pr[:, 2] + self.cfg.height_above_drum
+        # pl[:, 2] = pl[:, 2] + self.cfg.height_above_drum
+        # pr[:, 2] = pr[:, 2] + self.cfg.height_above_drum
 
         pm_xy = (pl[:, 0:2] + pr[:, 0:2]) / 2
         theta0 = torch.atan2(pm_xy[:, 1], pm_xy[:, 0]) - 90*math.pi/180
 
-        theta7 = torch.full((N,), 25*math.pi/180, device=self.device)
-        theta8 = torch.full((N,), 25*math.pi/180, device=self.device)
+        # theta7 = torch.full((N,), 25*math.pi/180, device=self.device)
+        # theta8 = torch.full((N,), 25*math.pi/180, device=self.device)
+        theta7 = torch.tensor([math.radians(self.cfg.hit_points[r_name][1]) for _, r_name in self.cfg.drum_pairs], device=self.device)   # 오른손 타격 손목 각도 (실기 json)
+        theta8 = torch.tensor([math.radians(self.cfg.hit_points[l_name][3]) for l_name, _ in self.cfg.drum_pairs], device=self.device)   # 왼손 타격 손목 각도 (실기 json)
 
         out, err = ik_solver.solve_geometric_ik(pr, pl, theta0, theta7, theta8)    # (N, 9)
 
         if err.any():
             failed = [self.cfg.drum_pairs[i] for i in torch.where(err > 0.5)[0].tolist()]
             raise RuntimeError(f"[RobotInitializer] IK failed for {len(failed)}/{N} pairs: {failed}")
+
+        out[:, 7] = out[:, 7] + math.radians(self.cfg.wrist_stay_deg)    # 오른손 손목 대기 각도만큼 들기 (IK 결과 7 = right_wrist)
+        out[:, 8] = out[:, 8] + math.radians(self.cfg.wrist_stay_deg)    # 왼손 손목 (IK 결과 8 = left_wrist)
 
         self.pos_angle = torch.zeros((N, self.cfg.num_ctrl_joint), device=self.device)
 
@@ -102,6 +131,7 @@ class RobotInitializer:
         rand = torch.randint(0, N, (len(env_ids),), device=self.device)
 
         init_pos = self.pos_angle[rand, :]
-        init_pos = init_pos + self.cfg.joint_noise_scale * torch.randn_like(init_pos)
+        # init_pos = init_pos + self.cfg.joint_noise_scale * torch.randn_like(init_pos)
+        init_pos = init_pos + self.cfg.joint_noise_scale * torch.randn_like(init_pos) * self.noise_mask   # 허리·어깨 yaw만 노이즈
 
         return init_pos, self.pair_drum_idx[rand]   # (n, 9) 시작 관절각, (n, 2) 시작 자세 드럼 [왼손, 오른손]

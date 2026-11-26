@@ -5,13 +5,12 @@
         손별 목표 드럼 = 스티킹 플래너가 배정한 그 손의 다음 음표 (배정 없으면 그 손이 직전에 친 드럼)
         직전 드럼은 가상 타격(음표 시각에 담당 손이 쳤다고 간주)으로 갱신 (drumrobot_env._virtual_hits)
         목표 허리 = (두 팔이 드럼을 향할 수 있음 ∩ 두 손 다 d ≤ d_th) 인 허리 중 식 (6) L 최소
-                    교집합이 없으면 방향 가능한 허리 중 넘은 거리² 합 최소 (별도의 도달 벌은 없음)
                     단, 이전 목표 허리가 새 쌍에서도 교집합 안이면 바꾸지 않고 유지
 행동 변화 (모든 관절)
         -w_act_rate × Σ_j (a_j,t - a_j,t-1)²   (행동 = 목표 속도라서 변화량 = 가속, 고정 관절은 행동이 0이라 0)
-허리 속도 (θ0*가 바뀐 뒤 이동 시간이 지나면)
-        s < vel_free_ratio × D 이면 0, 아니면 -w_vel × q̇0²
-        (s = θ0*가 바뀐 뒤 지난 시간, D = 바뀐 순간 다음 음표까지 남은 시간. θ0*가 안 바뀌면 s가 계속 커져 벌 유지 = 가만히 있어야 함)
+허리 속도 (기준 궤적 속도 추종, 매 스텝)
+        -w_vel × |q̇0 - θ̇0_d|
+        (θ0_d = θ0*가 바뀌면 직전 θ0_d 에서 θ0* 로 가는 최소 저크 궤적, 이동 시간 D = 바뀐 순간 다음 음표까지 남은 시간. 도착 뒤엔 θ̇0_d = 0 = 가만히 있어야 함)
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from dataclasses import dataclass, field
 import torch    # pyright: ignore[reportMissingImports]
 
 from .specs import EnvRuntimeSpec, Instruments, RobotSpec
+from .hit_detector import HitResult
 
 
 # ============================================================
@@ -83,7 +83,7 @@ class AlignmentReward:
         self.target_waist = torch.zeros(N, device=device)                           # 현재 목표 허리 θ0*
         self.env_arange = torch.arange(N, device=device)
 
-        # 속도 벌 시계 (θ0*가 바뀐 뒤 D × vel_free_ratio 까지는 속도 벌 없음)
+        # 허리 기준 궤적: θ0*가 바뀌면 직전 θ0_d 에서 θ0* 로 최소 저크 (이동 시간 D), 정렬 오차·속도 벌·관측에 씀
         self.step_dt = env.step_dt                                                  # 정책 스텝 [s] (15 ms)
         self.horizon_s = (env.max_lookahead_step - 1) * env.step_dt                 # 남은 시간 1.0의 길이 [s] (65칸 × 15 ms = 0.975 s)
         self.waist_s = torch.zeros(N, device=device)                                # s: θ0*가 바뀐 뒤 지난 시간 [s]
@@ -159,11 +159,11 @@ class AlignmentReward:
         keep = self._reach_check(pR, pL, self.target_waist[:, None])[3].squeeze(1)  # (N,) 이전 목표 ∈ B
         ok = torch.isfinite(self.pair_cost[ar, self.target_r, self.target_l])
         table = torch.where(ok, self.pair_waist[ar, self.target_r, self.target_l], self.target_waist)
-        prev_waist = self.target_waist.clone()                                      # 바뀌기 전 θ0* (속도 벌 시계용)
+        prev_waist = self.target_waist.clone()                                      # 바뀌기 전 θ0* (기준 궤적 시계용)
         self.target_waist = torch.where(keep, self.target_waist, table)
         t = arm_t.masked_fill(~arm_valid, 1.0).amin(dim=-1)                         # 시간 가중: 가장 가까운 배정 음표 (없으면 1)
 
-        # 속도 벌 시계 갱신: θ0*가 바뀌면 s=0, D=남은 시간. θ0*가 안 바뀌면 s += step_dt, D 유지
+        # 기준 궤적 시계 갱신: θ0*가 바뀌면 s=0, D=남은 시간. θ0*가 안 바뀌면 s += step_dt, D 유지
         changed = (self.target_waist != prev_waist) | self.waist_new
         self.waist_new[:] = False
         self.waist_s = torch.where(changed, torch.zeros_like(self.waist_s), self.waist_s + self.step_dt)
@@ -284,12 +284,26 @@ class AlignmentReward:
 # ============================================================
 @dataclass
 class RewardCfg:
-    w_align: float = 1.0                    # 정렬 보상 전체 배율
+    w_align: float = 3.0                    # 정렬 보상 전체 배율
     align: AlignmentRewardCfg = field(default_factory=AlignmentRewardCfg)
-    # w_act_rate: float = 0.03                 # 행동 변화(가속) 비용
-    w_act_rate: float = 0.3                  # 행동 변화(가속) 비용 (10배: 명령 떨림 억제)
+    w_act_rate: float = 0.5                 # 행동 변화(가속) 비용
     w_vel: float = 0.03                     # 허리 속도 비용
-    w_vel_yaw: float = 0.015                # 어깨 yaw 속도 비용 (오른 + 왼)
+    w_vel_yaw: float = 0.015                # 어깨 yaw 속도 비용 
+    w_hit: float = 5.0                      # 타격 성공 보상: 음표를 매칭 범위 안에서 담당 손이 위에서 쳤을 때 한 번 (× 시간 오차 점수)
+    hit_sigma_s: float = 0.075              # 타격 성공 시간 허용폭 σ_t [s]: 오차 60 ms면 0.53, 100 ms면 0.17, 150 ms(매칭 범위 끝)면 0.02
+    w_miss: float = 2.0                     # 놓침 패널티: 뒤쪽 매칭 범위가 끝날 때까지 못 친 음표마다 한 번
+    w_wrong: float = 1.5                    # 잘못 침 패털티: 범위 밖·두 번 치기·다른 손 타격 + 밑면·옆면 접촉, 사건마다 한 번
+    w_self: float = 0.5                     # 자기 충돌 패널티: 왼팔–오른팔 (상완·전완·손목/스틱) 어느 조합이든 닿아 있는 스텝마다
+    w_press: float = 0.05                   # 얹어 두기 패널티: 연속 접촉이 press_grace_s 를 넘으면 스텝마다 (손·드럼별, 그 스텝 중 넘은 비율만큼)
+    w_proximity: float = 1.5                # 근접 패널티: 손별 다음 음표 드럼 조준점까지 거리² × exp(-k × 남은 시간), 스텝마다
+    w_progress: float = 4.0                 # 진척 보상 (옛 보상 f03b27b): 이번 스텝에 조준점까지 거리²가 줄어든 만큼 (멀어지면 벌)
+    k_time_to_hit: float = 3.0              # 근접 패널티 시간 감쇠: 남은 시간(0~1, 미리보기 범위로 정규화)이 짧을수록 커짐
+    aim_offset: float = 0.04                # [m] 조준점 = 드럼 윗면 중심에서 x로 자기 어깨 쪽 (왼손 -x, 오른손 +x)
+    # w_impact_vel: float = 3.0               # 세게 치기 보상 (옛 보상 f03b27b): 맞힌 타격의 내려치는 속도 / impact_vel_max, 음표마다 한 번 (상한 없음)
+    w_impact_vel: float = 2.0               # 세게 치기 보상 (옛 보상 f03b27b): 맞힌 타격의 내려치는 속도 / impact_vel_max, 음표마다 한 번 (상한 없음)
+    impact_vel_max: float = 1.0             # [m/s] 세게 치기 정규화 기준
+    w_wrist_vel: float = 0.75               # 손목 쓰기 보상: 맞힌 타격의 접촉 직전 손목 각속도 [rad/s] (내려치는 방향 +, 위로 젖히면 -), 음표마다 한 번
+
 
 
 class RewardComputer:
@@ -306,10 +320,15 @@ class RewardComputer:
         self.prev_a = torch.zeros((env.num_envs, len(joint_names)), device=device)  # 직전 스텝 행동 (행동 변화 비용용)
         self.j_waist = joint_names.index("waist_joint")                              # 허리 관절 인덱스 (허리 속도 비용용)
         self.j_yaw = [joint_names.index("right_shoulder_1"), joint_names.index("left_shoulder_1")]   # 어깨 yaw [오른, 왼] (yaw 속도 비용용)
+        self.env_arange = torch.arange(env.num_envs, device=device)
+        self.prev_tip = torch.zeros((env.num_envs, 2, 3), device=device)                       # 직전 스텝 팁 위치 [왼손, 오른손] (진척 보상용)
+        self.has_prev_tip = torch.zeros(env.num_envs, dtype=torch.bool, device=device)         # 리셋 직후 첫 스텝은 직전 위치 없음 -> 진척 0
+        self.aim_sign = torch.tensor([-1.0, 1.0], device=device).view(1, 2)                    # 조준 오프셋 x 방향 [왼손 -x, 오른손 +x]
 
     def reset(self, env_ids: torch.Tensor, drum_pos: torch.Tensor, init_drum: torch.Tensor):
         self.alignment.reset(env_ids=env_ids, drum_pos=drum_pos, init_drum=init_drum)
         self.prev_a[env_ids] = 0.0
+        self.has_prev_tip[env_ids] = False
 
     def compute(
             self,
@@ -321,6 +340,10 @@ class RewardComputer:
             arm_t: torch.Tensor,
             arm_valid: torch.Tensor,
             actions: torch.Tensor,
+            hit: HitResult,
+            self_contact: torch.Tensor,
+            tip_pos: torch.Tensor,
+            arm_matched: torch.Tensor,
             waist_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         # hit_per_arm: (N, 2, M) 이번 스텝 타격 (가상 타격) -> 손별 직전 드럼 갱신용
@@ -331,6 +354,10 @@ class RewardComputer:
         # arm_t:       (N, 2) 손별 다음 음표까지 남은 시간 (0~1, 없으면 1)
         # arm_valid:   (N, 2) 손별 다음 음표 있음
         # actions:     (N, 9) 이번 스텝 행동 (-1 ~ 1, = 관절 목표 속도 / 배율)
+        # hit:         실제 접촉 타격 판정 + 악보 매칭 결과 (HitDetector.step, 타격 보상용)
+        # self_contact: (N, 3, 3) 자기 충돌 [왼 상완, 왼 전완, 왼 손목] x [오른 상완, 오른 전완, 오른 손목], 이번 스텝 닿았으면 True
+        # tip_pos:     (N, 2, 3) 스틱 끝 위치 [왼손, 오른손] (env 좌표, 근접·진척 보상용)
+        # arm_matched: (N, 2) 손별 다음 음표를 이미 맞힘 (일찍 맞힌 뒤 음표 시각까지 근접·진척 끔)
         # waist_q:     (N,) 양자화된 허리 q0 (어깨 yaw 끝점 θk* 계산용, None = joint_pos 의 q0)
         align, align_log = self.alignment.compute(
             joint_pos=joint_pos,
@@ -350,13 +377,58 @@ class RewardComputer:
         r_vel = -self.cfg.w_vel * (joint_vel[:, self.j_waist] - self.alignment.ref_vel).abs()
         r_vel_yaw = -self.cfg.w_vel_yaw * (joint_vel[:, self.j_yaw] - self.alignment.ref_yaw_vel).abs().sum(dim=1)
 
-        reward = r_align + r_act_rate + r_vel + r_vel_yaw
+        # 타격 (실제 접촉 판정): 성공은 시간 오차 점수만큼, 놓침·잘못 침은 사건마다(드럼별 합)
+        r_hit = self.cfg.w_hit * (hit.matched.float() * torch.exp(-(hit.time_error / self.cfg.hit_sigma_s) ** 2)).sum(dim=-1)
+        r_miss = -self.cfg.w_miss * hit.missed.float().sum(dim=-1)
+        r_wrong = -self.cfg.w_wrong * (hit.wrong_hit.float() + hit.bad_contact.float()).sum(dim=-1)
+        r_press = -self.cfg.w_press * hit.press.sum(dim=(1, 2))                            # 얹어 두기 (손·드럼 합)
+
+        # 근접·진척 (옛 보상 f03b27b, 손별): 플래너가 배정한 손별 다음 음표 드럼의 조준점으로 팁을 당김. 다음 음표 없는 손은 0
+        aim = drum_pos[self.env_arange[:, None], arm_drum]                                 # (N, 2, 3) 손별 다음 음표 드럼 윗면 중심
+        aim[..., 0] = aim[..., 0] + self.aim_sign * self.cfg.aim_offset                    # 자기 어깨 쪽으로 조준
+        # on = arm_valid.float()                                                             # (N, 2)
+        on = (arm_valid & ~arm_matched).float()                                            # (N, 2) 다음 음표 있고 아직 안 맞힘
+        d2_now = ((tip_pos - aim) ** 2).sum(dim=-1)                                        # (N, 2) 지금 팁 -> 조준점 거리²
+        d2_prev = ((self.prev_tip - aim) ** 2).sum(dim=-1)                                 # (N, 2) 직전 팁 -> 지금 조준점 (목표가 바뀌어도 튀지 않게)
+        r_proximity = -self.cfg.w_proximity * (torch.exp(-self.cfg.k_time_to_hit * arm_t) * d2_now * on).sum(dim=-1)
+        r_progress = self.cfg.w_progress * ((d2_prev - d2_now) * on).sum(dim=-1) * self.has_prev_tip.float()
+        self.prev_tip = tip_pos.clone()
+        self.has_prev_tip[:] = True
+
+        # 세게 치기 (옛 보상 f03b27b): 맞힌 타격의 내려치는 속도에 비례 (드럼별 합)
+        r_impact = self.cfg.w_impact_vel * (hit.matched.float() * hit.matched_speed.clamp(min=0.0)).sum(dim=-1) / self.cfg.impact_vel_max
+
+        # 손목 쓰기: 맞힌 타격의 접촉 직전 손목 각속도에 비례 (내려치는 방향 +, 위로 젖히면 패널티, 드럼별 합)
+        r_wrist = self.cfg.w_wrist_vel * (hit.matched.float() * hit.matched_wrist_vel).sum(dim=-1)
+        any_self = self_contact.flatten(1).any(dim=1)                                      # (N,) 왼팔–오른팔 어느 조합이든 닿음
+        r_self = -self.cfg.w_self * any_self.float()                                       # 자기 충돌 (닿아 있으면 스텝마다)
+        # reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact
+        reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact + r_wrist
         log_terms = {
             "rew_total": reward,
             "rew_align": r_align,
             "rew_act_rate": r_act_rate,
             "rew_vel": r_vel,
             "rew_vel_yaw": r_vel_yaw,
+            "rew_hit": r_hit,
+            "rew_miss": r_miss,
+            "rew_wrong": r_wrong,
+            "rew_press": r_press,
+            "rew_proximity": r_proximity,
+            "rew_progress": r_progress,
+            "rew_impact": r_impact,
+            "rew_wrist": r_wrist,
+            "n_matched": hit.matched.float().sum(dim=-1),       # 이번 스텝 맞힌 음표 수
+            "n_missed": hit.missed.float().sum(dim=-1),         # 이번 스텝 놓친 음표 수
+            "n_wrong": hit.wrong_hit.float().sum(dim=-1),       # 이번 스텝 잘못 친 타격 수 (범위 밖·두 번·다른 손)
+            "n_bad": hit.bad_contact.float().sum(dim=-1),       # 이번 스텝 밑면·옆면 접촉 수
+            "n_press": (hit.press > 0).float().sum(dim=(1, 2)), # 이번 스텝 대고 있는 (손, 드럼) 수
+            "rew_self": r_self,
+            "n_self": any_self.float(),                          # 이번 스텝 자기 충돌 (0/1)
+            **{f"self_{a}_{b}": self_contact[:, i, j].float()   # 조합별 자기 충돌 [왼 링크]_[오른 링크]
+               for i, a in enumerate(("upper", "fore", "wrist")) for j, b in enumerate(("upper", "fore", "wrist"))},
+            "v_matched_sum": (hit.matched_speed * hit.matched).sum(dim=-1),            # 맞힌 타격 내려치는 속도 합 [m/s] (÷ n_matched = 평균)
+            "w_matched_sum": (hit.matched_wrist_vel * hit.matched).sum(dim=-1),        # 맞힌 타격 손목 각속도 합 [rad/s], 내려치는 방향 + (÷ n_matched = 평균)
             **align_log,
         }
         return reward, log_terms

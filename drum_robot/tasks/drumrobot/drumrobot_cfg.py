@@ -82,9 +82,10 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     joint_vel_scale: float = 5.0
     obs_vel_noise_std: float = 0.06     # [rad/s] 관측 속도 가우시안 잡음 표준편차 (보상은 실제 값). 0이면 끔
     obs_pos_noise_std: float = 1.5e-4   # [rad] 관측 위치 가우시안 잡음 표준편차 (보상은 실제 값). 0이면 끔
-    # waist_dist_std: float = 0.5         # [N m] 허리 외란 토크 표준편차 (평균 0). 0이면 끔
+    obs_wrist_pos_noise_std: float = 6e-5   # [rad] 손목(Maxon) 관측 위치 잡음 표준편차 (실기 정지 잡음 6e-5 / 4e-5 이하). 손목 속도는 이 위치의 차분이라 따로 안 넣음
     waist_dist_std: float = 0.2         # [N m] 허리 외란 토크 표준편차 (평균 0). 0이면 끔
-    yaw_dist_std: float = 0.05          # [N m] 어깨 yaw 외란 토크 표준편차 (평균 0)
+    arm_dist_std: float = 0.05          # [N m] 어깨 yaw·pitch·팔꿈치 외란 토크 표준편차 (평균 0)
+    wrist_dist_std: float = 0.01        # [N m] 손목 외란 토크 표준편차 (평균 0)
     waist_dist_hold_s: float = 0.5      # [s] 평균 몇 초마다 외란을 새로 뽑을지 (env마다 따로)
 
     # Simulation
@@ -173,6 +174,20 @@ class DrumRobotEnvCfg(DirectRLEnvCfg):
     )
     contact_R_cfg: ContactSensorCfg = contact_L_cfg.replace(
         prim_path="/World/envs/env_.*/Robot/drumrobot_RL_urdf/right_wrist",
+    )
+
+    # 자기 충돌 접촉 센서: 왼팔 링크(상완·전완·손목)마다 1개, 오른팔 링크 3개만 걸러 받음 (force_matrix 는 센서당 prim 1개일 때 정확)
+    #   손목 링크 = 손목 캡슐 + 스틱 캡슐 -> 스틱·손목끼리 접촉도 잡힘. 드럼 접촉용 contact_L/R 와 별개
+    self_contact_upper_cfg: ContactSensorCfg = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/drumrobot_RL_urdf/left_shoulder_2",
+        filter_prim_paths_expr=[f"/World/envs/env_.*/Robot/drumrobot_RL_urdf/right_{n}" for n in ("shoulder_2", "elbow", "wrist")],
+        history_length=decimation,          # 정책 스텝 안의 물리 스텝 모두 기록
+    )
+    self_contact_fore_cfg: ContactSensorCfg = self_contact_upper_cfg.replace(
+        prim_path="/World/envs/env_.*/Robot/drumrobot_RL_urdf/left_elbow",
+    )
+    self_contact_wrist_cfg: ContactSensorCfg = self_contact_upper_cfg.replace(
+        prim_path="/World/envs/env_.*/Robot/drumrobot_RL_urdf/left_wrist",
     )
 
     # Scene

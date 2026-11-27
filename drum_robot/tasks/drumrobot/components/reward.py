@@ -293,16 +293,17 @@ class RewardCfg:
     hit_sigma_s: float = 0.075              # 타격 성공 시간 허용폭 σ_t [s]: 오차 60 ms면 0.53, 100 ms면 0.17, 150 ms(매칭 범위 끝)면 0.02
     w_miss: float = 2.0                     # 놓침 패널티: 뒤쪽 매칭 범위가 끝날 때까지 못 친 음표마다 한 번
     w_wrong: float = 1.5                    # 잘못 침 패털티: 범위 밖·두 번 치기·다른 손 타격 + 밑면·옆면 접촉, 사건마다 한 번
-    w_self: float = 0.5                     # 자기 충돌 패널티: 왼팔–오른팔 (상완·전완·손목/스틱) 어느 조합이든 닿아 있는 스텝마다
+    w_self: float = 2.5                     # 자기 충돌 패널티: 왼팔–오른팔 (상완·전완·손목/스틱) 어느 조합이든 닿아 있는 스텝마다
     w_press: float = 0.05                   # 얹어 두기 패널티: 연속 접촉이 press_grace_s 를 넘으면 스텝마다 (손·드럼별, 그 스텝 중 넘은 비율만큼)
     w_proximity: float = 1.5                # 근접 패널티: 손별 다음 음표 드럼 조준점까지 거리² × exp(-k × 남은 시간), 스텝마다
     w_progress: float = 4.0                 # 진척 보상 (옛 보상 f03b27b): 이번 스텝에 조준점까지 거리²가 줄어든 만큼 (멀어지면 벌)
     k_time_to_hit: float = 3.0              # 근접 패널티 시간 감쇠: 남은 시간(0~1, 미리보기 범위로 정규화)이 짧을수록 커짐
     aim_offset: float = 0.04                # [m] 조준점 = 드럼 윗면 중심에서 x로 자기 어깨 쪽 (왼손 -x, 오른손 +x)
-    # w_impact_vel: float = 3.0               # 세게 치기 보상 (옛 보상 f03b27b): 맞힌 타격의 내려치는 속도 / impact_vel_max, 음표마다 한 번 (상한 없음)
     w_impact_vel: float = 2.0               # 세게 치기 보상 (옛 보상 f03b27b): 맞힌 타격의 내려치는 속도 / impact_vel_max, 음표마다 한 번 (상한 없음)
     impact_vel_max: float = 1.0             # [m/s] 세게 치기 정규화 기준
     w_wrist_vel: float = 0.75               # 손목 쓰기 보상: 맞힌 타격의 접촉 직전 손목 각속도 [rad/s] (내려치는 방향 +, 위로 젖히면 -), 음표마다 한 번
+    w_wrist_drop: float = 5.0               # 손목 내려치기 보상: 맞힌 타격의 내려친 폭 Δθ 가 실기 목표 폭 Δθ* 에 가까울수록 (삼각형 점수 0~1), 음표마다 한 번
+    wrist_stay_deg: float = 20.0            # [deg] 실기 손목 대기 각도 (목표 폭 Δθ* = 대기 + L(T), 닿는 각도 0° 가정)
 
 
 
@@ -399,11 +400,20 @@ class RewardComputer:
         r_impact = self.cfg.w_impact_vel * (hit.matched.float() * hit.matched_speed.clamp(min=0.0)).sum(dim=-1) / self.cfg.impact_vel_max
 
         # 손목 쓰기: 맞힌 타격의 접촉 직전 손목 각속도에 비례 (내려치는 방향 +, 위로 젖히면 패널티, 드럼별 합)
-        r_wrist = self.cfg.w_wrist_vel * (hit.matched.float() * hit.matched_wrist_vel).sum(dim=-1)
+        # r_wrist = self.cfg.w_wrist_vel * (hit.matched.float() * hit.matched_wrist_vel).sum(dim=-1)
+
+        # 손목 내려치기 (실기 state_motion_generator.cpp): 목표 폭 Δθ* = 대기 20° + L(T), L(T) = 10° + 40°×T (T < 0.5 s), 30° (T >= 0.5 s)
+        #   Δθ = 손목 각도(접촉 T_down 전) - 손목 각도(접촉 직전), T_down = min(0.5T, 0.25 s) (HitDetector)
+        #   점수 = 목표에서 1, 0° 나 2배에서 0, 그 사이 직선 (드럼별 합)
+        T_note = hit.matched_T
+        drop_target = torch.deg2rad(self.cfg.wrist_stay_deg + torch.where(T_note < 0.5, 10.0 + 40.0 * T_note, torch.full_like(T_note, 30.0)))   # (N, M) Δθ* [rad]
+        drop_score = (1.0 - (hit.matched_wrist_drop - drop_target).abs() / drop_target).clamp(0.0, 1.0)                                        # (N, M)
+        r_wrist_drop = self.cfg.w_wrist_drop * (hit.matched.float() * drop_score).sum(dim=-1)
         any_self = self_contact.flatten(1).any(dim=1)                                      # (N,) 왼팔–오른팔 어느 조합이든 닿음
         r_self = -self.cfg.w_self * any_self.float()                                       # 자기 충돌 (닿아 있으면 스텝마다)
         # reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact
-        reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact + r_wrist
+        # reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact + r_wrist
+        reward = r_align + r_act_rate + r_vel + r_vel_yaw + r_hit + r_miss + r_wrong + r_press + r_self + r_proximity + r_progress + r_impact + r_wrist_drop
         log_terms = {
             "rew_total": reward,
             "rew_align": r_align,
@@ -417,7 +427,8 @@ class RewardComputer:
             "rew_proximity": r_proximity,
             "rew_progress": r_progress,
             "rew_impact": r_impact,
-            "rew_wrist": r_wrist,
+            # "rew_wrist": r_wrist,
+            "rew_wrist_drop": r_wrist_drop,
             "n_matched": hit.matched.float().sum(dim=-1),       # 이번 스텝 맞힌 음표 수
             "n_missed": hit.missed.float().sum(dim=-1),         # 이번 스텝 놓친 음표 수
             "n_wrong": hit.wrong_hit.float().sum(dim=-1),       # 이번 스텝 잘못 친 타격 수 (범위 밖·두 번·다른 손)
@@ -429,6 +440,8 @@ class RewardComputer:
                for i, a in enumerate(("upper", "fore", "wrist")) for j, b in enumerate(("upper", "fore", "wrist"))},
             "v_matched_sum": (hit.matched_speed * hit.matched).sum(dim=-1),            # 맞힌 타격 내려치는 속도 합 [m/s] (÷ n_matched = 평균)
             "w_matched_sum": (hit.matched_wrist_vel * hit.matched).sum(dim=-1),        # 맞힌 타격 손목 각속도 합 [rad/s], 내려치는 방향 + (÷ n_matched = 평균)
+            "drop_deg_matched_sum": torch.rad2deg(hit.matched_wrist_drop * hit.matched).sum(dim=-1),   # 맞힌 타격 내려친 폭 합 [deg] (÷ n_matched = 평균)
+            "drop_ratio_matched_sum": (hit.matched_wrist_drop / drop_target * hit.matched).sum(dim=-1), # 맞힌 타격 Δθ/Δθ* 합 (÷ n_matched = 평균, 1 = 실기 폭)
             **align_log,
         }
         return reward, log_terms

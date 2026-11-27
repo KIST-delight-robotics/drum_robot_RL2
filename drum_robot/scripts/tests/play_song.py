@@ -287,7 +287,12 @@ def _patched_make(*args, **kwargs):
             f.write(f"drum_noise: 0\nstart_pair: {START_PAIR}\njoint_noise: 0\nhand_assignment: planner (악보 R/L 안 씀)\n")
             f.write(f"waist: {waist_info}\n")
             f.write(f"recorded: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        rec.summary(rows, SONG.stem)
+            for line in rec.reward_summary():
+                f.write(line + "\n")
+        # rec.summary(rows, SONG.stem)
+        print(f"\n[play_song] {SONG.stem} 결과")
+        for line in rec.reward_summary():
+            print(f"[play_song] {line}")
         print(f"[play_song] 곡 끝: {OUT_CSV}")
         print(f"[play_song] 그래프: python drum_robot/scripts/tests/plot_align.py {OUT_DIR}\n")
         sys.stdout.flush()
@@ -301,7 +306,8 @@ def _patched_make(*args, **kwargs):
 
     if _args.waist_ref == "jerk":
         _apply_jerk_ref(u)
-    rec = AlignRecorder(u, print_s=_args.print_s, on_step=on_step, tag="play_song")
+    # rec = AlignRecorder(u, print_s=_args.print_s, on_step=on_step, tag="play_song")
+    rec = AlignRecorder(u, print_s=None, on_step=on_step, tag="play_song")     # 중간 각도 출력 없음 (곡 끝에 보상·성공만)
     return env
 
 

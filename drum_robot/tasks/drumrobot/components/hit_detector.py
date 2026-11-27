@@ -27,6 +27,11 @@ class HitDetectorCfg:
     # 얹어 두기: 같은 드럼에 연속으로 이 시간보다 오래 닿아 있으면 "대고 있음" (정상 타격의 짧은 접촉·튕김 재접촉은 통과)
     press_grace_s: float = 0.02         # [s] 물리 스텝 4개
 
+    # 손목 내려친 폭 (보상용): 같은 손 음표 간격 T -> 실기 내려치는 시간 T_down = min(0.5T, wrist_down_max_s) (실기 state_motion_generator.cpp HIT_TO_HIT)
+    wrist_T_min_s: float = 0.1          # T 하한 [s] (옛 보상 f03b27b 과 같음)
+    wrist_T_max_s: float = 1.0          # T 상한 [s] (그 손이 직전에 맞힌 음표가 없으면 이 값)
+    wrist_down_max_s: float = 0.25      # 내려치는 시간 상한 [s] (T >= 0.5 s 이면 이 값)
+
 @dataclass
 class HitResult:
     hit_per_arm: torch.Tensor   # (N, 2, M) bool   이번 스텝 정상 타격 (손별, 시각화·로그·보상용)
@@ -45,6 +50,8 @@ class HitResult:
     matched_speed: torch.Tensor # (N, M)    float  새로 맞힌 음표를 친 손의 내려치는 속도 [m/s] (matched일 때만 유효)
     matched_wrist_vel: torch.Tensor # (N, M) float 새로 맞힌 음표를 친 손의 접촉 직전 손목 각속도 [rad/s] (내려치는 방향 +, matched일 때만 유효)
     matched_grade: torch.Tensor # (N, M)    long   새로 맞힌 음표의 악보 세기 1~7 (matched일 때만 유효)
+    matched_wrist_drop: torch.Tensor # (N, M) float 새로 맞힌 음표를 친 손의 내려친 폭 [rad] = 손목 각도(접촉 T_down 전) - 손목 각도(접촉 직전) (matched일 때만 유효)
+    matched_T: torch.Tensor     # (N, M)    float  새로 맞힌 음표의 같은 손 음표 간격 T [s] (wrist_T_min_s ~ wrist_T_max_s, matched일 때만 유효)
 
 class HitDetector:
     def __init__(
@@ -72,6 +79,9 @@ class HitDetector:
         self.target_arm = torch.full((N, T + 1, M), -1, device=device, dtype=torch.int8)  # 목표별 담당 손 (0 왼손, 1 오른손, -1 미배정), 마지막 열은 버리는 칸
         self.arm_idx = torch.tensor([0, 1], device=device).view(1, 2, 1)                 # 손 번호 [왼손, 오른손]
         self.env_arange = torch.arange(N, device=device)
+        self.wrist_hist = None                                                            # (N, H, 2) 손목 각도 기록 [rad], 물리 스텝 단위, 시간 순 (첫 step 에서 만듦: H = 내려치는 시간 상한 + 정책 스텝 하나)
+        self.wrist_fresh = torch.ones(N, device=device, dtype=torch.bool)                # 리셋 직후 -> 다음 step 에서 기록을 그 첫 각도로 채움 (폭 0에서 시작)
+        self.last_note_step = torch.full((N, 2), -10 ** 6, device=device, dtype=torch.long)   # 손별 직전에 맞힌 음표의 악보 스텝 [왼손, 오른손] (없으면 아주 과거 -> T 상한)
 
     def reset(self, env_ids: torch.Tensor, rds: torch.Tensor):
         # rds: (N, T, M) 전체 악보. env_ids 행만 사용 (rds.reset 이후에 호출)
@@ -85,6 +95,8 @@ class HitDetector:
         self.prev_contact[env_ids] = False
         self.contact_time[env_ids] = 0.0
         self.target_arm[env_ids] = -1
+        self.wrist_fresh[env_ids] = True
+        self.last_note_step[env_ids] = -10 ** 6
 
     def set_target_arm(self, steps: torch.Tensor, ev_arm: torch.Tensor, ev_off: torch.Tensor):
         # 플래너 배정 -> 목표별 담당 손. 확정 전 배정은 매 스텝 덮어쓰고, 확정 뒤엔 같은 값이 다시 써짐
@@ -105,9 +117,12 @@ class HitDetector:
     # def step(self, contact_force: torch.Tensor, contact_from_tip: torch.Tensor, steps: torch.Tensor) -> HitResult:
     def step(self, contact_force: torch.Tensor, contact_from_tip: torch.Tensor, steps: torch.Tensor,
              # tip_vz_pre: torch.Tensor | None = None) -> HitResult:
-             tip_vz_pre: torch.Tensor | None = None, wrist_vel_pre: torch.Tensor | None = None) -> HitResult:
+             # tip_vz_pre: torch.Tensor | None = None, wrist_vel_pre: torch.Tensor | None = None) -> HitResult:
+             tip_vz_pre: torch.Tensor | None = None, wrist_vel_pre: torch.Tensor | None = None,
+             wrist_pos_pre: torch.Tensor | None = None) -> HitResult:
         # tip_vz_pre:       (N, D, 2) 물리 스텝별 그 물리 스텝 직전 스틱 끝 수직 속도 [m/s] (None 이면 내려치는 속도 0)
         # wrist_vel_pre:    (N, D, 2) 물리 스텝별 그 물리 스텝 직전 손목 각속도 [rad/s], 내려치는 방향 + (None 이면 0)
+        # wrist_pos_pre:    (N, D, 2) 물리 스텝별 그 물리 스텝 직전 손목 각도 [rad], 로봇 좌표계 드는 쪽 + (None 이면 내려친 폭 0)
         # contact_force:    (N, D, 2, M, 3) 물리 스텝별 스틱이 드럼에서 받은 힘 벡터 [N], 시간 순 (0이 가장 이른 물리 스텝)
         # contact_from_tip: (N, D, 2, M) 물리 스텝별 실제 접촉 지점이 스틱 끝에서 떨어진 거리 [m] (접촉 없으면 NaN)
         # steps:            (N,) 현재 스텝. 이번 정책 스텝 구간 = (steps - 1, steps]
@@ -161,6 +176,20 @@ class HitDetector:
         else:
             wrist_vel = torch.zeros_like(peak_force)
 
+        # 손목 각도 기록: 물리 스텝 단위로 뒤에 붙임 -> 이번 정책 스텝의 D개 = 마지막 [H-D, H)
+        if wrist_pos_pre is not None:
+            if self.wrist_hist is None:
+                H = round(self.cfg.wrist_down_max_s / dt_phys) + D
+                self.wrist_hist = wrist_pos_pre[:, :1].expand(-1, H, -1).clone()
+            H = self.wrist_hist.shape[1]
+            fresh = self.wrist_fresh
+            self.wrist_hist[fresh] = wrist_pos_pre[fresh, :1].expand(-1, H, -1)        # 리셋 직후: 첫 각도로 채움 (폭 0)
+            self.wrist_fresh[:] = False
+            self.wrist_hist = torch.cat([self.wrist_hist[:, D:], wrist_pos_pre], dim=1)
+            hist_arm = self.wrist_hist.permute(0, 2, 1)                                 # (N, 2, H)
+            idx_c = H - D + first                                                       # (N, 2, M) 접촉이 시작된 물리 스텝의 기록 위치
+            theta_c = hist_arm.gather(2, idx_c)                                         # (N, 2, M) 접촉 직전 손목 각도
+
         # 타격 시각 [스텝, 연속값] = 접촉이 시작된 물리 스텝 구간의 가운데 (D=2이면 steps-0.75 또는 steps-0.25)
         t_arm = (steps - 1).view(N, 1, 1).float() + (first.float() + 0.5) / D          # (N, 2, M) 손별
         hit_force = (peak_force * hit_per_arm).amax(dim=1)                              # (N, M)
@@ -176,7 +205,9 @@ class HitDetector:
         matched_speed = torch.zeros((N, M), device=self.device)
         matched_wrist_vel = torch.zeros((N, M), device=self.device)
         matched_grade = torch.zeros((N, M), device=self.device, dtype=torch.long)
-        remaining = hit_per_arm.clone()                                                 # (N, 2, M) 손별로 매칭
+        matched_wrist_drop = torch.zeros((N, M), device=self.device)
+        matched_T = torch.zeros((N, M), device=self.device)
+        remaining = hit_per_arm.clone()                                                # (N, 2, M) 손별로 매칭
         for d in range(-W - 1, W + 1):                         # 목표 후보 시점 k = steps + d
             k = steps + d
             valid = ((k >= 0) & (k < T)).view(N, 1, 1)
@@ -200,6 +231,18 @@ class HitDetector:
             wsp = torch.where(m & arm_ok, wrist_vel, torch.full_like(wrist_vel, -float("inf"))).amax(dim=1)         # (N, M) 담당 손 손목 각속도
             matched_wrist_vel = torch.where(new, wsp, matched_wrist_vel)
             matched_grade = torch.where(new, self.target_grade[ar, kc].long(), matched_grade)   # 맞힌 음표의 악보 세기
+            if wrist_pos_pre is not None:
+                # 내려친 폭: 같은 손 음표 간격 T (이번 음표 - 그 손이 직전에 맞힌 음표, 악보 시각) -> T_down 전 각도 - 접촉 직전 각도
+                T_arm = ((kc[:, None] - self.last_note_step).float() * dt).clamp(self.cfg.wrist_T_min_s, self.cfg.wrist_T_max_s)   # (N, 2) [s]
+                T_down = torch.clamp(0.5 * T_arm, max=self.cfg.wrist_down_max_s)                                 # (N, 2) 실기 내려치는 시간 [s]
+                lag = torch.round(T_down / dt_phys).long()                                                         # (N, 2) [물리 스텝]
+                drop = hist_arm.gather(2, (idx_c - lag[..., None]).clamp(min=0)) - theta_c                         # (N, 2, M) 내려친 폭 [rad]
+                dsel = torch.where(m & arm_ok, drop, -inf)
+                a_best = dsel.argmax(dim=1, keepdim=True)                                                          # (N, 1, M) 담당 손 (둘 다면 폭 큰 손)
+                matched_wrist_drop = torch.where(new, dsel.gather(1, a_best).squeeze(1), matched_wrist_drop)
+                matched_T = torch.where(new, T_arm[..., None].expand_as(drop).gather(1, a_best).squeeze(1), matched_T)
+                new_arm = (m & arm_ok & new[:, None, :]).any(dim=-1)                                               # (N, 2) 이번에 음표를 새로 맞힌 손
+                self.last_note_step = torch.where(new_arm, kc[:, None], self.last_note_step)
             remaining &= ~m
         wrong_hit = remaining.any(dim=1) | duplicate | wrong_arm   # 어떤 범위에도 안 든 타격 + 중복 타격 + 다른 손 타격
 
@@ -231,6 +274,8 @@ class HitDetector:
             matched_speed=matched_speed,
             matched_wrist_vel=matched_wrist_vel,
             matched_grade=matched_grade,
+            matched_wrist_drop=matched_wrist_drop,
+            matched_T=matched_T,
         )
 
     def _compute_match_window(self, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

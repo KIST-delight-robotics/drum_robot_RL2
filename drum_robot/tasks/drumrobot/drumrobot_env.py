@@ -168,6 +168,7 @@ class DrumRobotEnv(DirectRLEnv):
         self.contact_from_tip = torch.full((N, self.cfg.decimation, 2, M), float("nan"), device=self.device)   # (N, D, 2, M)
         self.tip_vz_pre = torch.zeros((N, self.cfg.decimation, 2), device=self.device)   # (N, D, 2) 물리 스텝별 그 물리 스텝 직전 스틱 끝 수직 속도 [m/s] (내려치는 속도)
         self.wrist_vel_pre = torch.zeros((N, self.cfg.decimation, 2), device=self.device)   # (N, D, 2) 물리 스텝별 그 물리 스텝 직전 손목 각속도 [rad/s] [왼손, 오른손], 내려치는 방향 +
+        self.wrist_pos_pre = torch.zeros((N, self.cfg.decimation, 2), device=self.device)   # (N, D, 2) 물리 스텝별 그 물리 스텝 직전 손목 각도 [rad] [왼손, 오른손], 로봇 좌표계 드는 쪽 + (내려친 폭용)
         self._substep = 0
 
         # 로봇 초기 위치 initializer
@@ -397,6 +398,7 @@ class DrumRobotEnv(DirectRLEnv):
             self.contact_from_tip[:, self._substep - 1] = self._get_contact_from_tip()
         self.tip_vz_pre[:, self._substep] = self._get_tip_velocity()[..., 2]   # 이번 물리 스텝 직전 스틱 끝 수직 속도 (로봇 상태 = 직전 물리 스텝 끝)
         self.wrist_vel_pre[:, self._substep] = -self.robot_interface.get_joint_vel(self.robot)[:, self.wrist_ids]   # 이번 물리 스텝 직전 손목 각속도, 내려치는 방향 + (로봇 좌표계 손목 각도는 드는 쪽이 +라서 부호 반대)
+        self.wrist_pos_pre[:, self._substep] = self.robot_interface.get_joint_pos(self.robot)[:, self.wrist_ids]   # 이번 물리 스텝 직전 손목 각도 (로봇 좌표계, 드는 쪽 +)
         self._substep += 1
 
         ctrl_joint_ids = self.robot_interface.get_ctrl_joint_ids()
@@ -446,6 +448,7 @@ class DrumRobotEnv(DirectRLEnv):
             steps=self.steps,
             tip_vz_pre=self.tip_vz_pre,
             wrist_vel_pre=self.wrist_vel_pre,
+            wrist_pos_pre=self.wrist_pos_pre,
         )
 
         # 자기 충돌: [왼 상완, 왼 전완, 왼 손목] x [오른 상완, 오른 전완, 오른 손목], 이번 정책 스텝의 물리 스텝 중 한 번이라도 닿으면 True

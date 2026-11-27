@@ -29,7 +29,8 @@ class AlignRecorder:
         self.names = list(Instruments().all.keys())
         self.dt = env.step_dt
         self.horizon_s = (env.rds.env.max_lookahead_step - 1) * self.dt    # 남은 시간 1.0 = 이 초
-        self.print_every = max(1, round(print_s / self.dt))
+        # self.print_every = max(1, round(print_s / self.dt))
+        self.print_every = max(1, round(print_s / self.dt)) if print_s else 0   # print_s None -> 중간 출력 없음
         self.on_episode_end = on_episode_end
         self.on_step = on_step
         self.tag = tag
@@ -38,6 +39,7 @@ class AlignRecorder:
 
         # 보상 항: compute 가 돌려주는 env별 로그를 잡아둠 (extras["log"]는 env 평균이라 안 씀)
         self.rew_log = {}
+        self.rew_sum = {}                               # 이번 에피소드 env 0번 로그 합 (rew_*, n_*, *_matched_sum)
         orig_compute = env.reward_computer.compute
         def compute(*args, **kwargs):
             reward, log = orig_compute(*args, **kwargs)
@@ -63,6 +65,7 @@ class AlignRecorder:
         step = int(env.steps[0].item())
         if step <= self.prev_step:                      # 리셋됨 -> 직전 에피소드 넘김
             rows, self.rows = self.rows, []
+            self.rew_sum = {}
             if self.on_episode_end and len(rows) >= 2:
                 self.on_episode_end(rows)
         self.prev_step = step
@@ -87,6 +90,9 @@ class AlignRecorder:
         t_s = (env.arm_t[0] * self.horizon_s).tolist()
         hit = env._virtual_hits()[0].any(dim=-1).tolist()                 # [왼손, 오른손] 이번 스텝 가상 타격
         rew = [self.rew_log[k][0].item() if k in self.rew_log else float("nan") for k in REW_KEYS]   # env 0번 보상 항 (없는 키는 nan)
+        for k, v in self.rew_log.items():                                    # env 0번 에피소드 합
+            if k.startswith(("rew_", "n_")) or k.endswith("_matched_sum"):
+                self.rew_sum[k] = self.rew_sum.get(k, 0.0) + v[0].item()
 
         row = [step * self.dt, waist_tgt, q0, self._near(th1, q1), q1, self._near(th2, q2), q2,
                drum[0] if valid[0] else -1, t_s[0] if valid[0] else float("nan"),
@@ -95,7 +101,8 @@ class AlignRecorder:
                c0, c1, c2] + rew + [waist_ref]
         self.rows.append(row)
 
-        if step % self.print_every == 0:
+        # if step % self.print_every == 0:
+        if self.print_every and step % self.print_every == 0:
             d = math.degrees
             def note(i):
                 return f"{self.names[row[i]]} {row[i + 1]:.2f}s" if row[i] >= 0 else "(없음)"
@@ -128,3 +135,18 @@ class AlignRecorder:
         e_w, e_r, e_l = err(1), err(3), err(5)
         print(f"\n[{self.tag}] {label}  평균 |오차|            허리 {mean(e_w):5.1f}°  오른어깨 {mean(e_r):5.1f}°  왼어깨 {mean(e_l):5.1f}°")
         print(f"[{self.tag}] {' ' * len(label)}  치기 직전(0.1초 안)    허리 {mean(e_w, near):5.1f}°  오른어깨 {mean(e_r, near):5.1f}°  왼어깨 {mean(e_l, near):5.1f}°")
+
+    def reward_summary(self):
+        # 에피소드 합 (env 0번, 지금 reward.py 로 계산한 값 = 학습 때 rewards_shaper 곱하기 전): 타격 수, 맞힌 타격 평균, 보상 항별 합
+        s = self.rew_sum
+        def g(k):
+            return s.get(k, float("nan"))
+        m, mi = g("n_matched"), g("n_missed")
+        n = max(m, 1.0)
+        lines = [f"음표 {m + mi:.0f}개: 맞힘 {m:.0f}, 놓침 {mi:.0f} (성공률 {100 * m / max(m + mi, 1.0):.1f}%), 잘못 침 {g('n_wrong'):.0f}, "
+                 f"밑면·옆면 {g('n_bad'):.0f}, 얹어 둠 {g('n_press'):.0f} (손·드럼 쌍 × 스텝), 자기 충돌 {g('n_self'):.0f} 스텝",
+                 f"맞힌 타격 평균: 내려치는 속도 {g('v_matched_sum') / n:.2f} m/s, 손목 각속도 {g('w_matched_sum') / n:.2f} rad/s, "
+                 f"손목 내려친 폭 {g('drop_deg_matched_sum') / n:.1f}° (목표 폭 대비 {g('drop_ratio_matched_sum') / n:.2f}배)",
+                 "보상 합 (에피소드):"]
+        lines += [f"    {k[4:]:<12} {v:+9.3f}" for k, v in s.items() if k.startswith("rew_")]
+        return lines
